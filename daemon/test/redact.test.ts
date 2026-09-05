@@ -76,4 +76,23 @@ describe('redact', () => {
     redact(input);
     expect(input.password).toBe('pw');
   });
+
+  it('redacts a camelCased token key, which has no separator to anchor on', () => {
+    const out = redact({ peerToken: 'abc123', bearerToken: 'xyz' }, []) as Record<string, unknown>;
+    expect(out['peerToken']).not.toContain('abc123');
+    expect(out['bearerToken']).not.toContain('xyz');
+  });
+
+  it('never redacts the identity fields the whole system joins on', () => {
+    // A regression here would not throw — it would quietly turn every event
+    // into an orphan whose session cannot be found again.
+    const out = redact(
+      { sessionId: 'a581da21-31c2', resumeSessionId: 'b16376c8', jobId: 'job-1', name: 'ghost-71' },
+      [],
+    ) as Record<string, unknown>;
+    expect(out['sessionId']).toBe('a581da21-31c2');
+    expect(out['resumeSessionId']).toBe('b16376c8');
+    expect(out['jobId']).toBe('job-1');
+    expect(out['name']).toBe('ghost-71');
+  });
 });

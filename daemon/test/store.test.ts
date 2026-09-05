@@ -92,9 +92,13 @@ describe('Store', () => {
 
   it('marks vanished sessions dead', () => {
     const now = '2026-09-05T00:00:00.000Z';
-    store.putSession({ sessionId: 's1', kind: 'observed', jobId: null, pid: 1, name: 'a', cwd: '/', alive: true, firstSeenAt: now, lastSeenAt: now });
-    store.putSession({ sessionId: 's2', kind: 'observed', jobId: null, pid: 2, name: 'b', cwd: '/', alive: true, firstSeenAt: now, lastSeenAt: now });
-    expect(store.markSessionsGone(['s1'])).toEqual(['s2']);
+    const base = { kind: 'observed', jobId: null, cwd: '/', alive: true, procStart: '111', status: 'idle', firstSeenAt: now, lastSeenAt: now } as const;
+    store.putSession({ ...base, sessionId: 's1', pid: 1, name: 'a' });
+    store.putSession({ ...base, sessionId: 's2', pid: 2, name: 'b' });
+    // A managed session the sweep cannot see must survive it (§4.1).
+    store.putSession({ ...base, kind: 'managed', sessionId: 's3', pid: 3, name: null, jobId: 'job-1' });
+    expect(store.markSessionsGone('observed', ['s1'])).toEqual(['s2']);
+    expect(store.getSession('s3')?.alive).toBe(true);
     expect(store.listSessions().find((s) => s.sessionId === 's2')?.alive).toBe(false);
   });
 });

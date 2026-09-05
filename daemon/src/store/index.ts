@@ -2,10 +2,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { paths } from '../paths.js';
-import { SCHEMA } from './schema.js';
+import { SCHEMA, SCHEMA_VERSION } from './schema.js';
 import { JsonlLog } from './jsonl.js';
 import {
   DEFAULT_SETTINGS,
+  type FleetKind,
   type HarnessState,
   type JobRecord,
   type JobStatus,
@@ -58,6 +59,8 @@ function rowToSession(r: Row): SessionRecord {
     name: nstr(r['name']),
     cwd: nstr(r['cwd']),
     alive: num(r['alive']) === 1,
+    procStart: nstr(r['proc_start']),
+    status: nstr(r['status']) as SessionRecord['status'],
     firstSeenAt: str(r['first_seen_at']),
     lastSeenAt: str(r['last_seen_at']),
     ...(harness ? { harness: JSON.parse(harness) as HarnessState } : {}),
@@ -75,8 +78,24 @@ export class Store {
   constructor(dbPath: string = paths.db, log: JsonlLog = new JsonlLog()) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.#db = new DatabaseSync(dbPath);
-    this.#db.exec(SCHEMA);
     this.#log = log;
+    // A projection is only worth having if it matches the code reading it.
+    // `CREATE TABLE IF NOT EXISTS` would happily leave a previous shape in
+    // place, so a version mismatch drops and rebuilds instead of migrating —
+    // cheap, because the JSONL logs are the actual truth (spec §4.3).
+    const found = num((this.#db.prepare('PRAGMA user_version').get() as Row)['user_version']);
+    if (found !== SCHEMA_VERSION) {
+      this.#db.exec(
+        'DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS costs;' +
+          ' DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS jobs;',
+      );
+      this.#db.exec(SCHEMA);
+      this.#db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      // A no-op on a fresh install, where there are no logs to read.
+      this.rebuildFromLogs();
+    } else {
+      this.#db.exec(SCHEMA);
+    }
     for (const r of this.#db.prepare('SELECT session_id, MAX(seq) AS m FROM events GROUP BY session_id').all() as Row[]) {
       this.#seq.set(str(r['session_id']), num(r['m']) + 1);
     }
@@ -202,11 +221,13 @@ export class Store {
   putSession(s: SessionRecord): void {
     this.#db
       .prepare(
-        `INSERT INTO sessions (session_id, kind, job_id, pid, name, cwd, alive, first_seen_at, last_seen_at, harness)
-         VALUES (?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO sessions (session_id, kind, job_id, pid, name, cwd, alive,
+                               proc_start, status, first_seen_at, last_seen_at, harness)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(session_id) DO UPDATE SET
            kind=excluded.kind, job_id=excluded.job_id, pid=excluded.pid,
            name=excluded.name, cwd=excluded.cwd, alive=excluded.alive,
+           proc_start=excluded.proc_start, status=excluded.status,
            last_seen_at=excluded.last_seen_at, harness=excluded.harness`,
       )
       .run(
@@ -217,6 +238,8 @@ export class Store {
         s.name,
         s.cwd,
         s.alive ? 1 : 0,
+        s.procStart ?? null,
+        s.status ?? null,
         s.firstSeenAt,
         s.lastSeenAt,
         s.harness ? JSON.stringify(s.harness) : null,
@@ -230,8 +253,25 @@ export class Store {
     return rows.map(rowToSession);
   }
 
-  markSessionsGone(aliveIds: readonly string[]): string[] {
-    const rows = this.#db.prepare('SELECT session_id FROM sessions WHERE alive = 1').all() as Row[];
+  getSession(sessionId: string): SessionRecord | null {
+    const row = this.#db
+      .prepare('SELECT * FROM sessions WHERE session_id = ?')
+      .get(sessionId) as Row | undefined;
+    return row ? rowToSession(row) : null;
+  }
+
+  /**
+   * Retire the live sessions of one kind that `aliveIds` no longer mentions.
+   *
+   * The kind filter is not decoration. Each source sees only its own sessions:
+   * the registry watcher enumerates observed ones, the runner tracks managed
+   * ones. An unscoped sweep would read "no managed sessions in this list" as
+   * "every managed session died" and empty the fleet view on the first tick.
+   */
+  markSessionsGone(kind: FleetKind, aliveIds: readonly string[]): string[] {
+    const rows = this.#db
+      .prepare('SELECT session_id FROM sessions WHERE alive = 1 AND kind = ?')
+      .all(kind) as Row[];
     const gone = rows.map((r) => str(r['session_id'])).filter((id) => !aliveIds.includes(id));
     for (const id of gone) {
       this.#db.prepare('UPDATE sessions SET alive = 0 WHERE session_id = ?').run(id);

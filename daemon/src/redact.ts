@@ -22,7 +22,12 @@ export const REDACTED = '[redacted]';
  * secret. A naive /token/i would destroy both.
  */
 const SENSITIVE_KEY_PATTERNS: readonly RegExp[] = [
-  /^token$/i,
+  // Any key *ending* in "token", not just a bare one or a snake_cased one:
+  // the session registry publishes `peerToken`, which the [_-] boundary in the
+  // rules below can never match because camelCase has no separator to anchor
+  // on. Over-redacting a field named "…token" costs nothing; under-redacting a
+  // live peer credential costs everything.
+  /token$/i,
   /(?:^|[_-])(?:secret|password|passwd|passphrase|credential|credentials)s?$/i,
   /(?:^|[_-])(?:api|access|private|secret|auth|encryption|signing)[_-]?keys?$/i,
   /(?:^|[_-])(?:auth|access|refresh|bearer|id|session)[_-]?tokens?$/i,

@@ -56,9 +56,15 @@ export function evaluateSteer(message: string, ctx: SteerContext): SteerDecision
     return refuse('not_steerable', `job ${ctx.job.id} was not submitted as steerable`);
   }
 
-  const name = ctx.session.name;
-  if (!name || !ctx.settings.steerAllowlist.includes(name)) {
-    return refuse('not_allowlisted', `session ${name ?? '(unnamed)'} is not in the steer allowlist`);
+  // The allowlist accepts either identifier, and both are checked against the
+  // live fleet row rather than against whatever the caller typed. A sessionId
+  // is the durable entry; a name is convenient but derived (F19), so an
+  // operator who allowlists "ghost-71" is allowlisting a string that may point
+  // at a different session after a restart.
+  const { name, sessionId } = ctx.session;
+  const allowed = ctx.settings.steerAllowlist;
+  if (!allowed.includes(sessionId) && !(name !== null && allowed.includes(name))) {
+    return refuse('not_allowlisted', `session ${name ?? sessionId} is not in the steer allowlist`);
   }
 
   const limit = ctx.settings.steerRateLimitPerHour;

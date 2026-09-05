@@ -46,10 +46,10 @@ one constrains the design; the citation is so a future reader can re-run it.
 | F1 | `claude -p --output-format stream-json` emits a complete, parseable event stream with `session_id`, per-turn cost, and a terminal `result`. | Probe returned `is_error: false`, `permission_denials: []`. |
 | F2 | A headless print session **can** call `SendMessage` to a named peer. | Courier probe: `result: 'SENT'`, no denials, $0.043; message physically arrived in the target session. |
 | F3 | A running courier registers itself as a live peer in the session registry. | Probe appeared as `scratchpad-b2`, socket `/run/user/1000/cc-socks/254422.sock`. |
-| F4 | `~/.claude/sessions/<pid>.json` is a live registry: `pid`, `sessionId`, `cwd`, `name`, `kind`, `messagingSocketPath`, `peerFeatures`. | 7 live records read. |
+| F4 | `~/.claude/sessions/<pid>.json` is a live registry carrying **full session identity**, not just a handle: `pid`, `sessionId`, `procStart`, `pidDomain`, `cwd`, `name`, `nameSource`, `nameSince`, `kind`, `entrypoint`, `status`, `statusUpdatedAt`, `startedAt`, `updatedAt`, `bridgeSessionId`, `messagingSocketPath`, `peerProtocol`, `peerFeatures`, `version` — 19 keys, identical shape in every file. | 7 live records, all keys dumped and compared (re-verified 2026-09-05). |
 | F5 | `~/.claude/jobs/<8hex>/` keys on `sessionId[:8]`, confirmed for all 7 dirs (`dirname == sessionId[:8] == daemonShort`). | Join test, 7/7 true. |
 | F6 | `~/.claude/jobs/` covers **daemon-backed sessions only**. Zero of 7 live interactive sessions have a dir; all 7 existing dirs are `backend: "daemon"` and stale (Aug 9–18). | Same test, `jobdir=no` for every live session. |
-| F7 | The rich status feed (`state`, `tempo`, `inFlight`, `fan`, `tokens`) exists only in that daemon-backed store — i.e. it is **not** available for an arbitrary interactive session. | Key-shape dump of all 7 `state.json`. |
+| F7 | The **rich** status feed (`state`, `tempo`, `inFlight`, `fan`, `tokens`) exists only in that daemon-backed store — i.e. it is **not** available for an arbitrary interactive session. A **coarse** `status` (`shell` \| `idle` \| `busy`) is a separate thing and *is* published per-session by the registry (F4). | Key-shape dump of all 7 `state.json`; coarse status observed live across all 7 registry files. |
 | F8 | ghostty has **no** send-to-existing-window IPC — spawn-only via `-e <cmd>`. konsole exposes full D-Bus via `qdbus6` while running. kitty needs `allow_remote_control` (not set). No tmux, no zellij installed. | Terminal capability probes. |
 | F9 | Harness state can contain plaintext secrets. `jobs/0c762231/adopt.json` held a live `DATABASE_URL`, `SESSION_SECRET`, and `ADMIN_PASSWORD` inside a captured command string. | Direct read. |
 | F10 | Model tier is a real cost lever: 5.8x Opus:Haiku on an identical trivial prompt ($0.274 vs $0.047). | Two probe runs. |
@@ -60,6 +60,8 @@ one constrains the design; the citation is so a future reader can re-run it.
 | F15 | `system`/`init` carries `claude_code_version`, `model`, `cwd`, `permissionMode`, `messaging_socket_path`. `result` carries `permission_denials`, `num_turns`, `duration_ms`. | Same capture. |
 | F16 | `--session-id <uuid>` is **accepted and honoured**: a pre-minted uuid comes back verbatim in every `session_id` field, exit 0. The job→session join therefore exists before the child produces a byte. |
 | F17 | A killed child's `'close'` can never arrive while an orphaned grandchild holds the stdout pipe. Claude Code spawns subprocesses of its own, so the child must be spawned `detached` and signalled as a **process group**, with `'exit'` arming a bounded wait for `'close'`. |
+| F18 | The registry's `procStart` equals field 22 of `/proc/<pid>/stat` (process start time in clock ticks since boot). Comparing them is therefore a sound liveness test that a **recycled pid cannot pass** — a registry file left behind by a killed session is detectable, where a bare `/proc/<pid>` existence check would be fooled. | Compared for all 7 live pids; 7/7 exact match. |
+| F19 | Peer `name` is `nameSource: "derived"` for every live session (`ghost-71`, `ghost-93`, …) — generated, not operator-assigned, and therefore **not stable across a restart**. It is a delivery address for the courier, never an identity or a durable allowlist entry. | `nameSource` read from all 7 files. |
 
 ## 3. Architecture
 
@@ -120,10 +122,18 @@ is known before the process starts. This stream carries messages, tool calls,
 tool results, per-turn cost, and the terminal result. Everything the dashboard
 promises about a job comes from here.
 
-**Source B — session registry (fleet-wide, thin).** Watch `~/.claude/sessions/*.json`
-plus periodic `ListAgents`. Yields existence, name, cwd, pid, liveness for
-*every* session including ones the orchestrator never spawned. This is what
+**Source B — session registry (fleet-wide, moderate).** Watch `~/.claude/sessions/*.json`.
+Yields real `sessionId`, name, cwd, pid, coarse `status`, and liveness for
+*every* session including ones the orchestrator never spawned (F4). This is what
 makes the fleet view honest about the whole machine.
+
+Two rules govern reading it. **Read narrowly** — the file carries 19 keys and a
+live `peerToken`; every field depended on is a field that can break the daemon,
+and the token must never reach an event payload. **Validate liveness, don't
+assume it** — a registry file outlives a killed session, so a file counts as a
+session only when `/proc` agrees the pid is alive *and* its start time still
+matches the file's `procStart` (F18). Existence checks alone hand a dead
+session's identity to whatever recycled its pid.
 
 **Source C — harness daemon store (advisory, sparse).** `~/.claude/jobs/<sid8>/`
 gives `state`, `tempo`, `inFlight`, `fan`, `tokens` — but only for daemon-backed
@@ -131,9 +141,11 @@ sessions (F6, F7). Read it when present, enrich the row, and **never** render a
 placeholder when absent.
 
 Because of F6/F7 the UI must distinguish two row classes and say so visibly:
-**managed** (source A — full detail) and **observed** (source B — name, cwd,
-liveness, nothing more). A dashboard that shows an empty `tempo` column for
-observed rows is lying by omission.
+**managed** (source A — full detail, including cost and the message stream) and
+**observed** (source B — identity, cwd, coarse `status`, liveness). The coarse
+status makes the observed class considerably more useful than a green dot, but
+the classes are still not interchangeable: a dashboard that shows an empty
+`tempo` or `$0.00` cost column for an observed row is lying by omission.
 
 **Ephemeral couriers are filtered from the fleet view** on F3: a session whose
 pid matches a courier the daemon spawned is suppressed.
@@ -262,6 +274,14 @@ Two hard rules:
 2. **Couriers for writes only, never reads.** A status poll through a courier
    costs real money for information already free in sources A/B/C. The daemon
    must never issue a courier to *ask* anything.
+
+A consequence of F19 worth stating outright: the courier addresses its target by
+peer **name**, but names are derived and change across a restart. So the
+allowlist is checked against the name *as resolved from the live fleet row*, and
+the durable record of "who may be steered" is the sessionId. A name that no
+longer resolves to a live session is a refusal, never a best-effort send — the
+alternative is paying $0.04 to deliver an instruction to whoever inherited the
+name.
 
 For jobs the daemon itself spawned there is a cheaper future path — keeping the
 child alive on `--input-format stream-json` and writing to its stdin, no courier

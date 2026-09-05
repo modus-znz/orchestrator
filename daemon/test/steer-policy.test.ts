@@ -6,7 +6,8 @@ const NOW = Date.UTC(2026, 8, 5, 12, 0, 0);
 
 const session = (over: Partial<SessionRecord> = {}): SessionRecord => ({
   sessionId: 's1', kind: 'managed', jobId: 'j1', pid: 123, name: 'worker-a',
-  cwd: '/tmp', alive: true, firstSeenAt: '', lastSeenAt: '', ...over,
+  cwd: '/tmp', alive: true, procStart: '111', status: 'idle',
+  firstSeenAt: '', lastSeenAt: '', ...over,
 });
 
 const jobRec = (over: Partial<JobRecord> = {}): JobRecord => ({
@@ -76,5 +77,23 @@ describe('steer policy', () => {
     // why the allowlist is operator-set and empty by default.
     const d = evaluateSteer('x', ctx({ job: null, session: session({ kind: 'observed', jobId: null }) }));
     expect(d).toEqual({ allowed: true });
+  });
+
+  it('accepts a sessionId in the allowlist, since derived names are not durable', () => {
+    const decision = evaluateSteer('go', ctx({
+      settings: { ...DEFAULT_SETTINGS, steerAllowlist: ['s1'] },
+      session: session({ name: 'renamed-after-restart' }),
+    }));
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('matches the allowlist against the live row, not against a caller-supplied name', () => {
+    // The caller cannot smuggle in an allowlisted name: the name comes from the
+    // fleet row, and this row's name is not on the list.
+    const decision = evaluateSteer('go', ctx({
+      settings: { ...DEFAULT_SETTINGS, steerAllowlist: ['worker-a'] },
+      session: session({ sessionId: 's9', name: 'worker-b' }),
+    }));
+    expect(decision).toMatchObject({ allowed: false, code: 'not_allowlisted' });
   });
 });

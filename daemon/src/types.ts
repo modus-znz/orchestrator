@@ -2,10 +2,17 @@
  * The event model. Every ingest source (§4.1 of the design spec) normalises
  * into `OrchestratorEvent` before it touches the bus, the store, or the API.
  *
- * Identity rule (§4): `sessionId` is the primary key for anything
- * session-shaped. `jobId` is orchestrator-assigned and is null for sessions we
- * observe but did not spawn. A job maps to one *or more* sessionIds over its
- * life, because --resume and --fork-session mint new ones.
+ * Identity rule (§4): `sessionId` is the Claude Code session uuid, and it is
+ * the primary key for everything session-shaped. Both fleet sources supply a
+ * real one — we mint it ourselves for sessions we spawn (`--session-id`, F16),
+ * and `~/.claude/sessions/<pid>.json` carries it for sessions we merely observe
+ * (F4). There is deliberately no second identifier: a pid is not identity,
+ * because pids are recycled, and a peer `name` is not identity either, because
+ * it is derived rather than assigned (F19) and can change across a restart.
+ *
+ * `jobId` is orchestrator-assigned and is null for sessions we observe but did
+ * not spawn. A job maps to one *or more* sessionIds over its life, because
+ * --resume and --fork-session mint new session uuids.
  */
 
 export type JobStatus =
@@ -104,14 +111,27 @@ export interface JobRecord extends JobSpec {
  */
 export type FleetKind = 'managed' | 'observed';
 
+/** Coarse per-session liveness published by every interactive session (F4).
+ *  `null` means unknown — a managed headless child publishes no such field. */
+export type SessionStatus = 'shell' | 'idle' | 'busy';
+
 export interface SessionRecord {
+  /** The Claude Code session uuid. Always real, never synthesised. */
   readonly sessionId: string;
   readonly kind: FleetKind;
   readonly jobId: string | null;
   readonly pid: number | null;
+  /** Peer name — the courier's delivery address, NOT an identity. Claude Code
+   *  derives it (`nameSource: "derived"`, F19), so it is not stable across a
+   *  restart: allowlist and join on sessionId, address on name. */
   readonly name: string | null;
   readonly cwd: string | null;
   readonly alive: boolean;
+  /** /proc/<pid>/stat field 22, verified identical to the registry file's own
+   *  `procStart` (F18). Held so a recycled pid cannot impersonate a session
+   *  whose registry file was never cleaned up. */
+  readonly procStart: string | null;
+  readonly status: SessionStatus | null;
   readonly firstSeenAt: string;
   readonly lastSeenAt: string;
   /** Source C enrichment — present only for daemon-backed sessions (F6/F7).

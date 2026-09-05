@@ -1,3 +1,13 @@
+/**
+ * Bump on ANY change to the statements below. The store compares this against
+ * `PRAGMA user_version` and, on a mismatch, drops the projection and rebuilds
+ * it from the JSONL logs rather than migrating. That is only safe *because*
+ * SQLite is a projection (spec §4.3) — every statement here is idempotent, but
+ * `CREATE TABLE IF NOT EXISTS` is idempotent in the wrong direction on a schema
+ * change: it silently keeps the old columns and the new code reads nulls.
+ */
+export const SCHEMA_VERSION = 1;
+
 /** SQLite is a *projection* of the JSONL logs (spec §4.3): losing it is an
  *  inconvenience, never data loss. Every statement here is idempotent. */
 export const SCHEMA = `
@@ -38,6 +48,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   name          TEXT,
   cwd           TEXT,
   alive         INTEGER NOT NULL DEFAULT 1,
+  -- /proc/<pid>/stat field 22. Verified equal to the registry file's own
+  -- procStart across all live sessions (F18), which is what makes it a sound
+  -- guard against a recycled pid impersonating a dead session.
+  proc_start    TEXT,
+  -- Coarse liveness from the registry: shell | idle | busy. Present for every
+  -- interactive session, unlike the rich harness feed (F7).
+  status        TEXT,
   first_seen_at TEXT NOT NULL,
   last_seen_at  TEXT NOT NULL,
   harness       TEXT
