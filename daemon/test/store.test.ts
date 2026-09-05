@@ -82,6 +82,32 @@ describe('Store', () => {
     store = rebuilt;
   });
 
+  it('assigns a fleet-wide event id that orders sessions against each other', () => {
+    // The point of the id: seq 0 in two different sessions says nothing about
+    // which happened first, and an SSE client needs exactly that.
+    const a = store.appendEvent(ev({ sessionId: 'sess-a', seq: 0 }));
+    const b = store.appendEvent(ev({ sessionId: 'sess-b', seq: 0 }));
+    expect(b).toBeGreaterThan(a);
+    expect(store.latestEventId()).toBe(b);
+  });
+
+  it('returns the existing id when an event is replayed, not a fresh one', () => {
+    const first = store.appendEvent(ev({ sessionId: 'sess-a', seq: 0 }));
+    const again = store.appendEvent(ev({ sessionId: 'sess-a', seq: 0 }));
+    expect(again).toBe(first);
+  });
+
+  it('reads events after a cursor, bounded by a limit', () => {
+    for (let i = 0; i < 5; i++) store.appendEvent(ev({ sessionId: 'sess-a', seq: i }));
+    const after = store.eventsSince(2);
+    expect(after.map((e) => e.id)).toEqual([3, 4, 5]);
+    expect(store.eventsSince(0, 2)).toHaveLength(2);
+  });
+
+  it('reports 0 as the latest id before anything has happened', () => {
+    expect(store.latestEventId()).toBe(0);
+  });
+
   it('merges stored settings over defaults', () => {
     expect(store.getSettings().maxConcurrency).toBe(3);
     const next = store.putSettings({ maxConcurrency: 8, defaultModel: 'opus' });

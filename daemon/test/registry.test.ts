@@ -174,6 +174,67 @@ describe('RegistryWatcher', () => {
     expect(seen.some((e) => e.sessionId === 'sess-managed')).toBe(false);
   });
 
+  it('enriches a managed session with the peer name from its own registry file (F20)', () => {
+    // A session we spawned registers itself under the sessionId we minted, so
+    // the join is exact. Without this the courier has no address for a managed
+    // session and every steer to a job fails.
+    store.putSession({
+      sessionId: 'sess-managed', kind: 'managed', jobId: 'job-1', pid: null,
+      name: null, cwd: '/srv/app', alive: true, procStart: null, status: null,
+      firstSeenAt: '2026-09-05T09:00:00.000Z', lastSeenAt: '2026-09-05T09:00:00.000Z',
+    });
+    write(4242, 'sess-managed', { name: 'scratchpad-29' });
+    watcher.scan();
+    const row = store.getSession('sess-managed');
+    expect(row?.name).toBe('scratchpad-29');
+    expect(row?.pid).toBe(4242);
+    // The kind must survive: it decides who owns the row's lifecycle.
+    expect(row?.kind).toBe('managed');
+    expect(row?.jobId).toBe('job-1');
+  });
+
+  it('does not announce a managed session the runner already reported', () => {
+    store.putSession({
+      sessionId: 'sess-managed', kind: 'managed', jobId: 'job-1', pid: null,
+      name: null, cwd: '/srv/app', alive: true, procStart: null, status: null,
+      firstSeenAt: '', lastSeenAt: '',
+    });
+    write(4242, 'sess-managed');
+    watcher.scan();
+    expect(seen.filter((e) => e.type === 'session.registered')).toHaveLength(0);
+  });
+
+  it('leaves a managed session alive when its registry file disappears', () => {
+    // A -p child can exit its registry entry while the runner is still reading
+    // the tail of its stream. Only the runner may call that job dead.
+    store.putSession({
+      sessionId: 'sess-managed', kind: 'managed', jobId: 'job-1', pid: null,
+      name: null, cwd: '/srv/app', alive: true, procStart: null, status: null,
+      firstSeenAt: '', lastSeenAt: '',
+    });
+    write(4242, 'sess-managed');
+    watcher.scan();
+    rmSync(join(dir, '4242.json'));
+    proc.live.delete(4242);
+    watcher.scan();
+    expect(store.getSession('sess-managed')?.alive).toBe(true);
+    expect(seen.some((e) => e.type === 'session.gone')).toBe(false);
+  });
+
+  it('preserves harness enrichment across a sweep instead of overwriting it', () => {
+    write(4242, 'sess-a');
+    watcher.scan();
+    const base = store.getSession('sess-a');
+    expect(base).not.toBeNull();
+    store.putSession({
+      ...(base as SessionRecord),
+      harness: { state: 'busy', detail: 'running tests', tempo: 'fast',
+                 inFlightTasks: 2, inFlightQueued: 0, fanCount: 1 },
+    });
+    watcher.scan();
+    expect(store.getSession('sess-a')?.harness?.detail).toBe('running tests');
+  });
+
   it('skips a half-written file instead of crashing the sweep', () => {
     writeFileSync(join(dir, '1.json'), '{"pid":1,"sessionId":');
     write(4242, 'sess-good');

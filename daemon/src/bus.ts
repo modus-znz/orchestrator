@@ -1,8 +1,8 @@
 import { redact } from './redact.js';
 import type { Store } from './store/index.js';
-import type { OrchestratorEvent, UnsequencedEvent } from './types.js';
+import type { OrchestratorEvent, StoredEvent, UnsequencedEvent } from './types.js';
 
-export type Subscriber = (event: OrchestratorEvent) => void;
+export type Subscriber = (event: StoredEvent) => void;
 
 /**
  * The single ingest path. Everything — spawned children, the registry watcher,
@@ -18,7 +18,7 @@ export class EventBus {
     this.#store = store;
   }
 
-  publish(event: UnsequencedEvent): OrchestratorEvent {
+  publish(event: UnsequencedEvent): StoredEvent {
     const literals = this.#store.getSettings().redactPatterns;
     const full: OrchestratorEvent = {
       ...event,
@@ -27,15 +27,18 @@ export class EventBus {
       payload: redact(event.payload, literals),
       seq: this.#store.nextSeq(event.sessionId),
     };
-    this.#store.appendEvent(full);
+    // The projection assigns the fleet-wide id, so subscribers are handed the
+    // stored event rather than the one we built: an SSE client needs the id it
+    // can later resume from, not the one we hoped it would get.
+    const stored: StoredEvent = { ...full, id: this.#store.appendEvent(full) };
     for (const sub of this.#subs) {
       try {
-        sub(full);
+        sub(stored);
       } catch {
         // A misbehaving SSE client must not be able to stop ingest.
       }
     }
-    return full;
+    return stored;
   }
 
   subscribe(sub: Subscriber): () => void {

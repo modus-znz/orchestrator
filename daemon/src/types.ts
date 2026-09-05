@@ -24,7 +24,10 @@ export type JobStatus =
   | 'cancelled'
   | 'budget_exceeded';
 
-export type EventSource = 'child' | 'registry' | 'harness';
+/** Where an event entered the system. `api` covers everything an operator
+ *  initiated — a steer, a settings change — which is neither something a child
+ *  said nor something we observed. */
+export type EventSource = 'child' | 'registry' | 'harness' | 'api';
 
 export type EventType =
   | 'job.queued'
@@ -61,6 +64,16 @@ export interface OrchestratorEvent {
 
 /** An event before the bus has stamped it with a sequence number. */
 export type UnsequencedEvent = Omit<OrchestratorEvent, 'seq'>;
+
+/**
+ * An event once the projection has stored it. `id` is fleet-wide and
+ * monotonic; `seq` is per session. Anything that has to order the whole fleet
+ * — the SSE stream and its `Last-Event-ID` resume above all — uses `id`, and
+ * anything scoped to one session's transcript uses `seq`.
+ */
+export interface StoredEvent extends OrchestratorEvent {
+  readonly id: number;
+}
 
 export type ModelTier = 'haiku' | 'sonnet' | 'opus' | 'fable';
 

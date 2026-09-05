@@ -12,6 +12,7 @@ import {
   type JobStatus,
   type OrchestratorEvent,
   type SessionRecord,
+  type StoredEvent,
   type Settings,
 } from '../types.js';
 
@@ -46,6 +47,19 @@ function rowToJob(r: Row): JobRecord {
     exitCode: nnum(r['exit_code']),
     error: nstr(r['error']),
     cliVersion: nstr(r['cli_version']),
+  };
+}
+
+function rowToEvent(r: Row): StoredEvent {
+  return {
+    id: num(r['id']),
+    jobId: nstr(r['job_id']),
+    sessionId: str(r['session_id']),
+    seq: num(r['seq']),
+    ts: str(r['ts']),
+    source: str(r['source']) as OrchestratorEvent['source'],
+    type: str(r['type']) as OrchestratorEvent['type'],
+    payload: JSON.parse(str(r['payload'] ?? 'null')),
   };
 }
 
@@ -107,11 +121,18 @@ export class Store {
     return next;
   }
 
-  /** Writes JSONL first, then SQLite. If the process dies between the two the
-   *  log is still authoritative and rebuild() closes the gap. */
-  appendEvent(event: OrchestratorEvent, { toLog = true } = {}): void {
+  /**
+   * Writes JSONL first, then SQLite. If the process dies between the two the
+   * log is still authoritative and rebuild() closes the gap.
+   *
+   * Returns the fleet-wide `id` the projection assigned. The JSONL record
+   * deliberately does not carry it: the id is a property of the projection,
+   * reassigned deterministically on every rebuild, and writing it to the log
+   * would make the log claim an ordering it does not own.
+   */
+  appendEvent(event: OrchestratorEvent, { toLog = true } = {}): number {
     if (toLog) this.#log.append(event);
-    this.#db
+    const inserted = this.#db
       .prepare(
         `INSERT OR IGNORE INTO events (session_id, seq, job_id, ts, source, type, payload)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -144,6 +165,15 @@ export class Store {
           num(p['outputTokens']),
         );
     }
+    // A replayed event hits the UNIQUE(session_id, seq) constraint and inserts
+    // nothing; report the id it already has rather than a misleading 0.
+    if (inserted.changes === 0) {
+      const existing = this.#db
+        .prepare('SELECT id FROM events WHERE session_id = ? AND seq = ?')
+        .get(event.sessionId, event.seq) as Row | undefined;
+      return existing ? num(existing['id']) : 0;
+    }
+    return Number(inserted.lastInsertRowid);
   }
 
   // ---- jobs -------------------------------------------------------------
@@ -201,19 +231,40 @@ export class Store {
     return rows.map(rowToJob);
   }
 
-  eventsForJob(jobId: string, fromSeq = 0): OrchestratorEvent[] {
+  /**
+   * A job's transcript from `fromSeq` onward.
+   *
+   * `seq` is the right cursor here and only here: a job's events all belong to
+   * one session at a time. A job that was resumed or forked spans more than one
+   * sessionId, each with its own `seq` restarting at zero — so the rows are
+   * ordered by the fleet-wide `id`, and `fromSeq` filters within them rather
+   * than ordering them.
+   */
+  eventsForJob(jobId: string, fromSeq = 0): StoredEvent[] {
     const rows = this.#db
-      .prepare('SELECT * FROM events WHERE job_id = ? AND seq >= ? ORDER BY seq')
+      .prepare('SELECT * FROM events WHERE job_id = ? AND seq >= ? ORDER BY id')
       .all(jobId, fromSeq) as Row[];
-    return rows.map((r) => ({
-      jobId: nstr(r['job_id']),
-      sessionId: str(r['session_id']),
-      seq: num(r['seq']),
-      ts: str(r['ts']),
-      source: str(r['source']) as OrchestratorEvent['source'],
-      type: str(r['type']) as OrchestratorEvent['type'],
-      payload: JSON.parse(str(r['payload'] ?? 'null')),
-    }));
+    return rows.map(rowToEvent);
+  }
+
+  /**
+   * Events after a fleet-wide cursor, for SSE resume via `Last-Event-ID`.
+   *
+   * Bounded by `limit` because a client that has been away for a day must not
+   * be able to make the daemon materialise its entire history in one buffer;
+   * the caller pages by feeding back the last id it received.
+   */
+  eventsSince(afterId: number, limit = 500): StoredEvent[] {
+    const rows = this.#db
+      .prepare('SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?')
+      .all(afterId, limit) as Row[];
+    return rows.map(rowToEvent);
+  }
+
+  /** The newest fleet-wide event id, or 0 when nothing has happened yet. */
+  latestEventId(): number {
+    const r = this.#db.prepare('SELECT MAX(id) AS m FROM events').get() as Row;
+    return num(r['m']);
   }
 
   // ---- sessions ---------------------------------------------------------

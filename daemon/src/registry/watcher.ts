@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { EventBus } from '../bus.js';
 import type { Store } from '../store/index.js';
-import type { SessionRecord, SessionStatus } from '../types.js';
+import type { FleetKind, SessionRecord, SessionStatus } from '../types.js';
 import { linuxProc, type ProcTable } from './proc.js';
 
 /** Where Claude Code publishes one JSON file per live session, named `<pid>.json`. */
@@ -119,9 +119,14 @@ export class RegistryWatcher {
       if (started === null || started !== String(file.procStart)) continue;
 
       const known = this.#store.getSession(file.sessionId);
+      // A session we spawned registers itself here too, under the sessionId we
+      // minted for it (F20) — so a file we recognise is an *enrichment* of a
+      // managed row, not a new observed one. Downgrading its kind would hand
+      // its lifecycle to this watcher, which does not own it.
+      const kind: FleetKind = known?.kind ?? 'observed';
       live.push({
         sessionId: file.sessionId,
-        kind: 'observed',
+        kind,
         jobId: known?.jobId ?? null,
         pid: file.pid,
         name: file.name ?? null,
@@ -131,11 +136,18 @@ export class RegistryWatcher {
         status: asStatus(file.status),
         firstSeenAt: known?.firstSeenAt ?? ts,
         lastSeenAt: ts,
+        // putSession overwrites every column it is given, so an enrichment
+        // sweep that omitted this would erase source C's state twice a second.
+        ...(known?.harness ? { harness: known.harness } : {}),
       });
     }
 
     for (const session of live) {
       this.#store.putSession(session);
+      // The runner already announced the sessions it spawned; a second
+      // 'registered' event for the same session would make the log describe an
+      // event that did not happen.
+      if (session.kind !== 'observed') continue;
       if (this.#announced.has(session.sessionId)) continue;
       this.#announced.add(session.sessionId);
       this.#bus.publish({
@@ -153,11 +165,12 @@ export class RegistryWatcher {
       });
     }
 
-    // Scoped to 'observed': this watcher has no view of the sessions we spawned
-    // ourselves, and absence from a list you cannot see is not evidence of death.
+    // Scoped to 'observed', and the list is filtered to observed rows for the
+    // same reason: a managed session's death is the runner's to declare, and
+    // this watcher's view is not evidence about rows it does not own.
     for (const sessionId of this.#store.markSessionsGone(
       'observed',
-      live.map((s) => s.sessionId),
+      live.filter((s) => s.kind === 'observed').map((s) => s.sessionId),
     )) {
       this.#announced.delete(sessionId);
       this.#bus.publish({

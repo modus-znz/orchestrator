@@ -6,7 +6,7 @@
  * `CREATE TABLE IF NOT EXISTS` is idempotent in the wrong direction on a schema
  * change: it silently keeps the old columns and the new code reads nulls.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** SQLite is a *projection* of the JSONL logs (spec §4.3): losing it is an
  *  inconvenience, never data loss. Every statement here is idempotent. */
@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_alive ON sessions(alive);
 
 CREATE TABLE IF NOT EXISTS events (
+  -- A fleet-wide cursor. seq is monotonic per session, so it cannot order
+  -- two events from different sessions and cannot serve as an SSE
+  -- Last-Event-ID. This is a plain INTEGER PRIMARY KEY rather than an
+  -- AUTOINCREMENT one *on purpose*: rebuilding the projection replays the
+  -- JSONL logs in order and must reassign the same ids, so a client that
+  -- reconnects with id 500 resumes at the same place across a rebuild.
+  id         INTEGER PRIMARY KEY,
   session_id TEXT NOT NULL,
   seq        INTEGER NOT NULL,
   job_id     TEXT,
@@ -69,7 +76,9 @@ CREATE TABLE IF NOT EXISTS events (
   source     TEXT NOT NULL,
   type       TEXT NOT NULL,
   payload    TEXT NOT NULL,
-  PRIMARY KEY (session_id, seq)
+  -- Still the idempotency key: INSERT OR IGNORE drops a replayed event on
+  -- this constraint exactly as it did when it was the primary key.
+  UNIQUE (session_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_job  ON events(job_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts);

@@ -133,7 +133,13 @@ export function judge(result: CourierResult | null, exitCode: number | null): De
   if (result.denials > 0) {
     return { delivered: false, costUsd: cost, error: `courier was denied ${result.denials} tool call(s)` };
   }
-  if (!result.text.trim().startsWith(SENT)) {
+  // Equality, not a prefix. "SENT" as a prefix would also accept "SENT... but
+  // actually the peer was gone", and a false positive here tells an operator
+  // their instruction landed when it did not — strictly worse than a false
+  // negative, whose cost is one retry at four cents. Trailing punctuation is
+  // forgiven because that is a stylistic tic, not a different claim.
+  const said = result.text.trim().replace(/[.!\s]+$/, '');
+  if (said !== SENT) {
     return { delivered: false, costUsd: cost, error: result.text.trim() || 'courier did not confirm delivery' };
   }
   return { delivered: true, costUsd: cost, error: null };
@@ -169,7 +175,9 @@ export class Courier {
       jobId: null,
       sessionId: req.sessionId,
       ts: new Date().toISOString(),
-      source: 'harness',
+      // A steer originates with an operator, not with a child we are reading or
+      // a file we are watching.
+      source: 'api',
       type: outcome.delivered ? 'steer.sent' : 'steer.failed',
       // The message itself is logged: a steer is an instruction someone gave a
       // running agent, and an audit trail without the instruction is not one.

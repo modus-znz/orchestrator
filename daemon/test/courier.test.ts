@@ -103,6 +103,12 @@ describe('judge', () => {
     expect(judge(r, 0).delivered).toBe(false);
   });
 
+  it('forgives a full stop but not a retraction after the confirmation', () => {
+    expect(judge(readResultLine(resultLine({ result: 'SENT.' })), 0).delivered).toBe(true);
+    const hedged = readResultLine(resultLine({ result: 'SENT... actually FAILED: no such peer' }));
+    expect(judge(hedged, 0).delivered).toBe(false);
+  });
+
   it('reports a run that produced no result line at all', () => {
     expect(judge(null, 127).error).toContain('no result line');
   });

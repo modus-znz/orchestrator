@@ -62,6 +62,7 @@ one constrains the design; the citation is so a future reader can re-run it.
 | F17 | A killed child's `'close'` can never arrive while an orphaned grandchild holds the stdout pipe. Claude Code spawns subprocesses of its own, so the child must be spawned `detached` and signalled as a **process group**, with `'exit'` arming a bounded wait for `'close'`. |
 | F18 | The registry's `procStart` equals field 22 of `/proc/<pid>/stat` (process start time in clock ticks since boot). Comparing them is therefore a sound liveness test that a **recycled pid cannot pass** — a registry file left behind by a killed session is detectable, where a bare `/proc/<pid>` existence check would be fooled. | Compared for all 7 live pids; 7/7 exact match. |
 | F19 | Peer `name` is `nameSource: "derived"` for every live session (`ghost-71`, `ghost-93`, …) — generated, not operator-assigned, and therefore **not stable across a restart**. It is a delivery address for the courier, never an identity or a durable allowlist entry. | `nameSource` read from all 7 files. |
+| F20 | A **headless `-p` child registers itself in the session registry too**, under the sessionId we minted for it, with a derived peer `name` and `entrypoint: "sdk-cli"`. Managed and observed sessions therefore steer through one code path: the watcher enriches the managed row by joining on `sessionId`, and the courier has an address for both. Headless sessions publish **no** `status` key, so coarse status stays null for them. | Probed with `--session-id`; the minted uuid came back verbatim in `~/.claude/sessions/<pid>.json` as `scratchpad-29`, `nameSource: derived`, `status` absent. |
 
 ## 3. Architecture
 
@@ -146,6 +147,23 @@ Because of F6/F7 the UI must distinguish two row classes and say so visibly:
 status makes the observed class considerably more useful than a green dot, but
 the classes are still not interchangeable: a dashboard that shows an empty
 `tempo` or `$0.00` cost column for an observed row is lying by omission.
+
+**Sources A and B overlap, and that is the mechanism, not a collision.** A
+headless child we spawn registers itself in the same directory, under the
+sessionId we minted for it (F20). So the watcher's job on a file it already
+knows is *enrichment*, not classification: it fills in the peer name, pid and
+`procStart` on the existing row and leaves `kind` alone. Downgrading a managed
+row to observed would hand its lifecycle to the watcher, which does not own it —
+and a managed session that leaves the registry is not dead, it is merely a job
+whose child has exited while the runner is still reading the tail of its stream.
+Only the runner may retire a managed row; only the watcher may retire an
+observed one.
+
+The same rule governs `status`. It is null for a managed session, because
+headless sessions publish no such key (F20), and null means **unknown** — the UI
+renders no dot at all rather than a grey one that implies "idle". `harness` is
+absent on the same terms; a sweep that overwrote either with a blank would be
+manufacturing a fact twice a second.
 
 **Ephemeral couriers are filtered from the fleet view** on F3: a session whose
 pid matches a courier the daemon spawned is suppressed.
@@ -255,9 +273,29 @@ Steer and attach are addressed by `sessionId`, not `jobId`, precisely because
 an observed session has no job (§4.1) yet must still be steerable and
 attachable. For a managed job the daemon resolves its current sessionId first.
 
+**Two cursors, and they are not interchangeable.** `seq` is monotonic *per
+session*, so it can order one session's transcript and nothing else — which is
+what `/api/jobs/:id/events?from=seq` wants, and why that route is the only one
+that takes it. The SSE stream orders the whole fleet, so it uses the projection's
+fleet-wide `events.id`: that is what `Last-Event-ID` carries and what a resume
+reads from. The id is a plain SQLite `INTEGER PRIMARY KEY`, not an
+`AUTOINCREMENT` one, so rebuilding the projection from the JSONL logs reassigns
+the same ids in the same order and a client that reconnects mid-rebuild resumes
+where it left off. One caveat the route must document: a job that was resumed or
+forked spans more than one sessionId, each with its own `seq` restarting at zero,
+so its transcript is *ordered* by id and merely *filtered* by `from`.
+
 Binds `127.0.0.1` only. A bearer token from `~/.claude/orchestrator/token`
 (mode 600) is required on every route including loopback, because any process
 on this box can reach loopback and this API spawns Claude sessions.
+
+The daemon **mints** that token on first start rather than requiring the operator
+to create one, and then **reads back the mode it actually got**: `writeFileSync`'s
+`mode` is masked by the process umask, so asking for 600 is not the same as
+having it. A token file any other user can read makes the bearer check theatre,
+so the daemon refuses to start rather than serve on a loopback socket with a
+readable credential. Comparison is `timingSafeEqual` on a length check, because a
+secret compared with `===` leaks its prefix to a patient caller.
 
 ## 6. Steering
 
@@ -286,7 +324,9 @@ name.
 For jobs the daemon itself spawned there is a cheaper future path — keeping the
 child alive on `--input-format stream-json` and writing to its stdin, no courier
 and no cost. Noted as a v2 optimisation; v1 uses the courier uniformly so both
-managed and observed sessions steer through one code path.
+managed and observed sessions steer through one code path — which F20 is what
+makes possible: a managed session has a peer name because it registers itself,
+so there is one address space for steering rather than two.
 
 ## 7. orc CLI
 
