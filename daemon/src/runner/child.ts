@@ -80,15 +80,6 @@ export class ChildRunner {
     const graceMs = this.#opts.killGraceMs ?? 5_000;
     const stdioGraceMs = this.#opts.stdioGraceMs ?? 2_000;
 
-    this.#bus.publish({
-      jobId: job.id,
-      sessionId,
-      ts: new Date().toISOString(),
-      source: 'child',
-      type: 'job.queued',
-      payload: { job },
-    });
-
     const child: ChildProcess = spawn(bin, buildArgs(job, sessionId, this.#opts), {
       cwd: job.cwd,
       // stdin at EOF, or the CLI blocks 3 seconds waiting for input (F12).

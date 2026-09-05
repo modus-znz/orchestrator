@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, openSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bool, list, num, str, type Parsed } from './args.js';
 import { api, stream, NotRunningError } from './client.js';
 import { age, bold, dim, table, truncate, usd } from './format.js';
-import { baseUrl, orchestratorHome, pidPath, port } from './paths.js';
+import { baseUrl, ensureHome, orchestratorHome, pidPath, port } from './paths.js';
 
 /** Mirrors of the daemon's wire types. Only the fields the CLI renders. */
 interface Job {
@@ -278,13 +278,7 @@ export async function daemon(p: Parsed): Promise<void> {
     if (!existsSync(entry)) {
       throw new Error(`daemon is not built (${entry} missing) — run \`npm run build -w @orchestrator/daemon\``);
     }
-    // The daemon creates this directory itself — but only once it is running,
-    // and the log fd and the pid file are both opened here, before the spawn.
-    // On a machine that has never run the daemon, `orc daemon start` therefore
-    // fails on ENOENT with the state directory as the missing file, which
-    // reads like a corrupt install rather than a first run.
-    // 0700 because the bearer token lives in this directory.
-    mkdirSync(orchestratorHome(), { recursive: true, mode: 0o700 });
+    ensureHome();
 
     // Detached with its output on a file: a daemon whose stdout is the
     // launching terminal dies with that terminal, which is not a daemon.

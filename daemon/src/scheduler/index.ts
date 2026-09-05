@@ -1,6 +1,6 @@
 import type { EventBus } from '../bus.js';
 import type { ChildRunner, RunHandle } from '../runner/child.js';
-import type { Store } from '../store/index.js';
+import { applyJobStarted, type Store } from '../store/index.js';
 import type { JobRecord, JobSpec, JobStatus } from '../types.js';
 import { newJobId } from './ids.js';
 
@@ -49,6 +49,17 @@ export class Scheduler {
     this.#store = store;
     this.#bus = bus;
     this.#runner = runner;
+
+    // The child announces its CLI version in its init message, which arrives
+    // seconds *after* the spawn — so #start cannot know it, and the row it
+    // writes cannot carry it. Projecting it here, off the same event replay
+    // reads, is what keeps a live row and a rebuilt one identical.
+    bus.subscribe((e) => {
+      if (e.type !== 'job.started' || !e.jobId) return;
+      const job = this.#store.getJob(e.jobId);
+      if (!job) return;
+      this.#store.putJob(applyJobStarted(job, e.ts, e.sessionId, (e.payload ?? {}) as Record<string, unknown>));
+    });
   }
 
   get runningCount(): number {
@@ -90,7 +101,28 @@ export class Scheduler {
     });
 
     this.#assertAcyclic(resolved);
-    for (const job of resolved) this.#store.putJob(job);
+    for (const job of resolved) {
+      this.#store.putJob(job);
+      // Emitted here, where a job actually becomes queued, and not at spawn.
+      // `rebuildFromLogs` clears the jobs table and reseeds it from exactly
+      // this event, so a job whose queued event waited for a spawn that never
+      // came existed only in SQLite — and a schema bump, which rebuilds, would
+      // have dropped the entire pending queue on the floor.
+      //
+      // The sessionId is the job id because there is no session yet and the
+      // event schema has no null to offer; replay reads the spec off the
+      // payload and never off this field. Same fallback as #finish.
+      this.#bus.publish({
+        jobId: job.id,
+        sessionId: job.sessionId ?? job.id,
+        ts: job.createdAt,
+        source: 'api',
+        type: 'job.queued',
+        payload: { job },
+      });
+    }
+    // After the loop: tick() can spawn a job before submit() returns, and a
+    // job.started ahead of its own job.queued would be unreplayable.
     this.tick();
     return resolved;
   }
@@ -153,7 +185,11 @@ export class Scheduler {
   #start(job: JobRecord): void {
     const handle = this.#runner.start(job);
     this.#handles.set(job.id, handle);
-    this.#store.putJob({ ...job, status: 'running', startedAt: new Date().toISOString(), sessionId: handle.sessionId });
+    // Re-read rather than spreading the `job` we were handed: start() can emit
+    // job.started before it returns, and the subscriber above will already have
+    // written cliVersion onto the row. Spreading a stale copy would erase it.
+    const current = this.#store.getJob(job.id) ?? job;
+    this.#store.putJob({ ...current, status: 'running', startedAt: current.startedAt ?? new Date().toISOString(), sessionId: handle.sessionId });
 
     void handle.done.then((outcome) => {
       this.#handles.delete(job.id);

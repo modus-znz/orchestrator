@@ -31,6 +31,28 @@ const nstr = (v: unknown): string | null => (v == null ? null : String(v));
 const num = (v: unknown): number => Number(v ?? 0);
 const nnum = (v: unknown): number | null => (v == null ? null : Number(v));
 
+/**
+ * The `job.started` projection, shared by the live scheduler and by replay.
+ *
+ * It exists as one function because it had two implementations and they drifted:
+ * replay read `cliVersion` off the event payload, the live path never did, and so
+ * every job that had not survived a restart reported a null CLI version — the one
+ * field that says which binary actually produced the run.
+ *
+ * `startedAt` prefers a time already on the row: the scheduler records the spawn,
+ * which is earlier and truer than the child's init message, while replay has only
+ * the event and falls through to its timestamp.
+ */
+export function applyJobStarted(job: JobRecord, ts: string, sessionId: string, payload: Row): JobRecord {
+  return {
+    ...job,
+    status: 'running',
+    startedAt: job.startedAt ?? ts,
+    sessionId,
+    cliVersion: nstr(payload['cliVersion']),
+  };
+}
+
 function rowToJob(r: Row): JobRecord {
   const tools = nstr(r['allowed_tools']);
   return {
@@ -524,7 +546,7 @@ export class Store {
       const job = e.jobId ? jobs.get(e.jobId) : undefined;
       if (!job) continue;
       if (e.type === 'job.started') {
-        jobs.set(job.id, { ...job, status: 'running', startedAt: e.ts, sessionId: e.sessionId, cliVersion: nstr(p['cliVersion']) });
+        jobs.set(job.id, applyJobStarted(job, e.ts, e.sessionId, p));
       } else if (e.type === 'cost.turn') {
         jobs.set(job.id, { ...job, costUsd: job.costUsd + num(p['usd']), numTurns: job.numTurns + 1 });
       } else if (e.type === 'job.finished' || e.type === 'job.failed' || e.type === 'job.cancelled' || e.type === 'job.budget_exceeded') {

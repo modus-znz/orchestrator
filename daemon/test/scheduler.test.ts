@@ -37,6 +37,7 @@ const spec = (name: string, dependsOn: string[] = []): JobSpec & { name: string 
 describe('Scheduler', () => {
   let store: InstanceType<typeof Store>;
   let runner: FakeRunner;
+  let bus: InstanceType<typeof EventBus>;
   let sched: InstanceType<typeof mod.Scheduler>;
 
   beforeEach(async () => {
@@ -47,7 +48,8 @@ describe('Scheduler', () => {
     mod = await import('../src/scheduler/index.js');
     store = new Store(join(home, 'orchestrator.db'));
     runner = new FakeRunner();
-    sched = new mod.Scheduler(store, new EventBus(store), runner as never);
+    bus = new EventBus(store);
+    sched = new mod.Scheduler(store, bus, runner as never);
   });
   afterEach(() => { store.close(); Store.destroyScratch(home); });
 
@@ -113,6 +115,54 @@ describe('Scheduler', () => {
     expect(sched.cancel(b!.id)).toBe(true);
     expect(store.getJob(b!.id)?.status).toBe('cancelled');
   });
+
+  // The provenance of a run — which claude binary produced it — is only knowable
+  // from the child's init message, which lands well after the spawn. It used to
+  // be projected onto the job row by replay alone, so a row read from a daemon
+  // that had not restarted always said null. These two assertions are the same
+  // question asked of the live path and of the rebuilt one, and they must agree.
+  describe('job.started projection', () => {
+    const started = (jobId: string, sessionId: string) =>
+      bus.publish({
+        jobId, sessionId, ts: new Date().toISOString(), source: 'child',
+        type: 'job.started', payload: { cliVersion: '2.1.261', model: 'haiku' },
+      });
+
+    it('records the cli version on the live path, not only after a rebuild', () => {
+      const [job] = sched.submit([spec('a')]);
+      sched.tick();
+      const id = job!.id;
+      expect(store.getJob(id)?.cliVersion).toBeNull(); // Not knowable yet.
+
+      started(id, `sess-${id}`);
+      expect(store.getJob(id)?.cliVersion).toBe('2.1.261');
+    });
+
+    it('agrees with what a rebuild from the log reconstructs', () => {
+      const [job] = sched.submit([spec('a')]);
+      sched.tick();
+      const id = job!.id;
+      started(id, `sess-${id}`);
+      const live = store.getJob(id);
+
+      store.rebuildFromLogs();
+      const rebuilt = store.getJob(id);
+      // The literal, not `live?.cliVersion` — comparing the two sides would
+      // pass just as happily if the projection broke on *both* and left both
+      // null, which is the exact bug this test exists to catch.
+      expect(live?.cliVersion).toBe('2.1.261');
+      expect(rebuilt?.cliVersion).toBe('2.1.261');
+
+      // startedAt is deliberately NOT equal across the two. The spawn is
+      // earlier and truer than the init message, so the live row keeps it
+      // while a rebuild has only the event and falls back to its ts. What is
+      // guaranteed is the ordering, and that neither side lost the field;
+      // asserting equality would pass only while both land in one millisecond.
+      expect(live?.startedAt).toBeTruthy();
+      expect(rebuilt?.startedAt).toBeTruthy();
+      expect(rebuilt!.startedAt! >= live!.startedAt!).toBe(true);
+      expect(rebuilt?.status).toBe(live?.status);
+    });
 });
 
 describe('job ids', () => {
@@ -123,4 +173,6 @@ describe('job ids', () => {
     expect([...ids].sort()).toEqual(ids);
     expect(new Set(ids).size).toBe(ids.length);
   });
+  });
+
 });
