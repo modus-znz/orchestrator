@@ -130,6 +130,12 @@ describe('Store', () => {
 });
 
 describe('queueDepthSeries', () => {
+  // `now` is pinned in every case below. The bucket domain runs to the present
+  // so that a queue still backed up this minute has a bucket to be drawn in,
+  // which makes an unpinned test quietly time-dependent: it would pass today
+  // and enumerate a year of empty hours next spring.
+  const NOW = '2026-09-05T14:00:00.000Z';
+
   it('counts a job as waiting in the hours between queueing and starting', async () => {
     // The defect this guards: counting `job.queued` events instead of spans
     // reports depth 0 for exactly the hours a job sat in the queue, because a
@@ -141,11 +147,49 @@ describe('queueDepthSeries', () => {
       startedAt: '2026-09-05T12:00:00.000Z',
       finishedAt: '2026-09-05T13:00:00.000Z',
     }));
-    const by = new Map(store.queueDepthSeries('hour').map((r) => [r.bucket, r]));
+    const by = new Map(store.queueDepthSeries('hour', NOW).map((r) => [r.bucket, r]));
     expect(by.get('2026-09-05T09')?.waiting).toBe(1);
     expect(by.get('2026-09-05T12')?.waiting).toBe(0);
     expect(by.get('2026-09-05T12')?.running).toBe(1);
     expect(by.get('2026-09-05T13')?.running).toBe(0);
+    store.close();
+  });
+
+  it('emits the quiet hours in between, where the backlog is worst', async () => {
+    // 10 and 11 saw no transition at all, so a domain collected from the
+    // timestamps that exist skipped them — and the chart drew a straight line
+    // from 09 to 12 across the three hours this job spent waiting.
+    const store = await freshStore();
+    store.putJob(job({
+      id: 'slow', status: 'succeeded',
+      createdAt: '2026-09-05T09:00:00.000Z',
+      startedAt: '2026-09-05T12:00:00.000Z',
+      finishedAt: '2026-09-05T13:00:00.000Z',
+    }));
+    const rows = store.queueDepthSeries('hour', NOW);
+    expect(rows.map((r) => r.bucket)).toEqual([
+      '2026-09-05T09', '2026-09-05T10', '2026-09-05T11',
+      '2026-09-05T12', '2026-09-05T13', '2026-09-05T14',
+    ]);
+    expect(rows.filter((r) => r.waiting === 1).map((r) => r.bucket)).toEqual([
+      '2026-09-05T09', '2026-09-05T10', '2026-09-05T11',
+    ]);
+    store.close();
+  });
+
+  it('runs the domain to now, so a queue that never moved is still drawn', async () => {
+    // Nothing has started or finished, so the last transition IS the creation.
+    // Without a domain that reaches the present, a queue three deep and stuck
+    // renders as a single bucket hours ago and then nothing.
+    const store = await freshStore();
+    for (const id of ['a', 'b', 'c']) {
+      store.putJob(job({ id, createdAt: '2026-09-05T11:00:00.000Z' }));
+    }
+    const rows = store.queueDepthSeries('hour', NOW);
+    expect(rows.map((r) => r.bucket)).toEqual([
+      '2026-09-05T11', '2026-09-05T12', '2026-09-05T13', '2026-09-05T14',
+    ]);
+    expect(rows.every((r) => r.waiting === 3)).toBe(true);
     store.close();
   });
 
@@ -158,7 +202,7 @@ describe('queueDepthSeries', () => {
       finishedAt: '2026-09-05T10:00:00.000Z',
     }));
     store.putJob(job({ id: 'later', createdAt: '2026-09-05T11:00:00.000Z', startedAt: '2026-09-05T11:30:00.000Z' }));
-    const by = new Map(store.queueDepthSeries('hour').map((r) => [r.bucket, r]));
+    const by = new Map(store.queueDepthSeries('hour', NOW).map((r) => [r.bucket, r]));
     expect(by.get('2026-09-05T09')?.waiting).toBe(1);
     // Without the finished_at arm this stays 1 forever, and the chart shows a
     // queue that never drains.
@@ -169,9 +213,35 @@ describe('queueDepthSeries', () => {
   it('buckets by day when asked', async () => {
     const store = await freshStore();
     store.putJob(job({ id: 'd', createdAt: '2026-09-05T09:00:00.000Z', startedAt: '2026-09-06T09:00:00.000Z' }));
-    const rows = store.queueDepthSeries('day');
+    const rows = store.queueDepthSeries('day', '2026-09-06T12:00:00.000Z');
     expect(rows.map((r) => r.bucket)).toEqual(['2026-09-05', '2026-09-06']);
     expect(rows[0]?.waiting).toBe(1);
     store.close();
   });
+
+  it('caps an ancient row to a recent window instead of enumerating six years', async () => {
+    // One job from 2020 would otherwise ask SQLite for every hour since — tens
+    // of thousands of rows, all of them zero, to draw one chart. The window is
+    // clamped at its START so the buckets kept are the recent ones; a cap that
+    // simply stopped the walk would have kept 2020 and dropped today.
+    const store = await freshStore();
+    store.putJob(job({ id: 'ancient', createdAt: '2020-01-01T00:00:00.000Z', startedAt: '2020-01-01T01:00:00.000Z', finishedAt: '2020-01-01T02:00:00.000Z' }));
+    store.putJob(job({ id: 'recent', createdAt: '2026-09-05T13:00:00.000Z' }));
+    const rows = store.queueDepthSeries('hour', NOW);
+    expect(rows.length).toBeLessThanOrEqual(2001);
+    expect(rows.at(-1)?.bucket).toBe('2026-09-05T14');
+    expect(rows.at(-1)?.waiting).toBe(1);
+    // 2020 is far outside the window, so it is not drawn at all.
+    expect(rows.some((r) => r.bucket.startsWith('2020'))).toBe(false);
+    store.close();
+  });
+
+  it('returns nothing at all when no job has ever been submitted', async () => {
+    // The generated domain starts at MIN(created_at), which is NULL on an empty
+    // table — the recursion must produce zero rows rather than one null bucket.
+    const store = await freshStore();
+    expect(store.queueDepthSeries('hour', NOW)).toEqual([]);
+    store.close();
+  });
 });
+

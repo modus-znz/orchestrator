@@ -26,6 +26,14 @@ export type Bucket = 'hour' | 'day';
 const bucketOf = (b: Bucket, col: string): string => `substr(${col}, 1, ${b === 'day' ? 10 : 13})`;
 const bucketExpr = (b: Bucket): string => bucketOf(b, 'ts');
 
+/** Roughly 83 days of hourly buckets, or five and a half years of daily ones. */
+const MAX_BUCKETS = 2000;
+
+/** Both ends of the generated span are rendered through this before they are
+ *  compared, because a lexicographic MAX over '2026-09-05T00:00:00Z' and
+ *  SQLite's own '2026-09-05 00:00:00' would order them by the separator. */
+const ISO = '%Y-%m-%dT%H:%M:%SZ';
+
 const str = (v: unknown): string => String(v ?? '');
 const nstr = (v: unknown): string | null => (v == null ? null : String(v));
 const num = (v: unknown): number => Number(v ?? 0);
@@ -442,18 +450,52 @@ export class Store {
    *
    * A job cancelled while still queued stops being counted at the bucket it
    * finished in, which is why the waiting arm tests `finished_at` too.
+   *
+   * The bucket domain is generated, not collected. Deriving it from the
+   * timestamps that exist — the obvious thing, and what this did — yields a row
+   * only for buckets where some job *transitioned*, so a queue that sat sixteen
+   * deep from 09:00 to 12:00 without a single start produced rows at 09 and 12
+   * and nothing between, and the chart drew a straight line across the exact
+   * hours the backlog was worst. The domain also has to run to `now` rather
+   * than to the last transition, or a queue that is still backed up this minute
+   * ends at whenever it last moved.
+   *
+   * Capped at MAX_BUCKETS so one ancient row cannot ask SQLite to enumerate
+   * every hour since. The cap moves the *start* of the window rather than
+   * stopping the walk early: the recursion runs forward, so truncating it
+   * would keep the oldest buckets and drop today's — precisely backwards for
+   * a dashboard, which is read from the right-hand edge.
    */
-  queueDepthSeries(bucket: Bucket = 'hour'): Array<{ bucket: string; waiting: number; running: number }> {
+  queueDepthSeries(
+    bucket: Bucket = 'hour',
+    now: string = new Date().toISOString(),
+  ): Array<{ bucket: string; waiting: number; running: number }> {
     const created = bucketOf(bucket, 'j.created_at');
     const started = bucketOf(bucket, 'j.started_at');
     const finished = bucketOf(bucket, 'j.finished_at');
+    // Must render exactly what bucketOf's substr() produces, or the generated
+    // domain and the per-job comparisons would be different alphabets.
+    const fmt = bucket === 'day' ? '%Y-%m-%d' : '%Y-%m-%dT%H';
+    const step = bucket === 'day' ? '+1 day' : '+1 hour';
+    const unit = bucket === 'day' ? 'days' : 'hours';
     const rows = this.#db
       .prepare(
-        `WITH b(bucket) AS (
-           SELECT DISTINCT ${bucketOf(bucket, 'created_at')} FROM jobs
-           UNION SELECT DISTINCT ${bucketOf(bucket, 'started_at')} FROM jobs WHERE started_at IS NOT NULL
-           UNION SELECT DISTINCT ${bucketOf(bucket, 'finished_at')} FROM jobs WHERE finished_at IS NOT NULL
-         )
+        `WITH RECURSIVE
+           span(lo, hi) AS (
+             SELECT MAX(strftime('${ISO}', MIN(created_at)),
+                        strftime('${ISO}', datetime(?, '-${MAX_BUCKETS} ${unit}'))),
+                    MAX(COALESCE(MAX(finished_at), ''), COALESCE(MAX(started_at), ''),
+                        MAX(created_at), ?)
+               FROM jobs
+           ),
+           b(bucket, t, n) AS (
+             SELECT strftime('${fmt}', lo), lo, 0 FROM span WHERE lo IS NOT NULL
+             UNION ALL
+             SELECT strftime('${fmt}', datetime(t, '${step}')), datetime(t, '${step}'), n + 1
+               FROM b, span
+              WHERE n < ${MAX_BUCKETS}
+                AND strftime('${fmt}', datetime(t, '${step}')) <= strftime('${fmt}', span.hi)
+           )
          SELECT b.bucket AS bkt,
                 SUM(CASE WHEN ${created} <= b.bucket
                           AND (j.started_at IS NULL OR ${started} > b.bucket)
@@ -465,7 +507,7 @@ export class Store {
            FROM b LEFT JOIN jobs j
           GROUP BY b.bucket ORDER BY b.bucket`,
       )
-      .all() as Row[];
+      .all(now, now) as Row[];
     return rows.map((r) => ({ bucket: str(r['bkt']), waiting: num(r['waiting']), running: num(r['running']) }));
   }
 
