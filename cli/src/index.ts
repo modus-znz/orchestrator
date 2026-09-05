@@ -17,9 +17,47 @@ const HELP = `${bold('orc')} — orchestrate Claude Code sessions
   orc steer <job|session> <text>   relay an instruction to a running session
   orc attach <job|session>    open a terminal on that session and hand it over
   orc fleet                   every live session, managed and observed
+  orc ui [--print]            open the dashboard (token in the URL fragment)
   orc daemon [start|stop|status]
 
 ${dim('Talks only to http://127.0.0.1 — set ORCHESTRATOR_PORT to change the port.')}`;
+
+/**
+ * Every flag each command actually reads.
+ *
+ * The parser cannot police this: it does not know the command, and it treats an
+ * unrecognised `--foo` as a boolean so that `--steerable` works without a table
+ * of every flag in the CLI. The cost of that leniency lands here — a typo'd
+ * `--file x.json` on `orc run` leaves `x.json` sitting in the positionals,
+ * which become the prompt, and the daemon dutifully spawns a billable session
+ * whose entire instruction is a file path. That happened, and it cost $0.13.
+ *
+ * So an unknown flag is a hard error rather than a warning. This is a tool that
+ * spends money on the strength of its arguments.
+ */
+const KNOWN: Readonly<Record<string, readonly string[]>> = {
+  run: ['model', 'cwd', 'budget', 'timeout', 'name', 'depends-on', 'permission-mode', 'steerable'],
+  batch: [],
+  ps: ['all', 'status'],
+  logs: ['follow'],
+  cancel: ['reason'],
+  steer: [],
+  attach: ['terminal'],
+  fleet: [],
+  ui: ['print'],
+  daemon: ['port'],
+};
+
+function rejectUnknownFlags(command: string, parsed: ReturnType<typeof parseArgs>): void {
+  const allowed = KNOWN[command];
+  if (allowed === undefined) return; // Unknown command; the switch reports it.
+  for (const flag of parsed.flags.keys()) {
+    if (!allowed.includes(flag)) {
+      const suffix = allowed.length ? ` — it takes ${allowed.map((f) => `--${f}`).join(', ')}` : ' — it takes no flags';
+      throw new Error(`orc ${command} has no --${flag}${suffix}`);
+    }
+  }
+}
 
 async function main(): Promise<number> {
   const [command, ...rest] = process.argv.slice(2);
@@ -28,6 +66,7 @@ async function main(): Promise<number> {
     return 0;
   }
   const parsed = parseArgs(rest);
+  rejectUnknownFlags(command, parsed);
 
   switch (command) {
     case 'run': await cmd.run(parsed); return 0;
@@ -38,6 +77,7 @@ async function main(): Promise<number> {
     case 'steer': await cmd.steer(parsed); return 0;
     case 'attach': await cmd.attach(parsed); return 0;
     case 'fleet': await cmd.fleet(); return 0;
+    case 'ui': await cmd.ui(parsed); return 0;
     case 'daemon': await cmd.daemon(parsed); return 0;
     default:
       process.stderr.write(`unknown command: ${command}\n\n${HELP}\n`);

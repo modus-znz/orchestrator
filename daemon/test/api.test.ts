@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -392,5 +392,60 @@ describe('GET /api/stream', () => {
 
   it('requires a token like every other route', async () => {
     await expect(collect('/api/stream', 1, { authorization: 'Bearer nope' })).rejects.toThrow(/status 401/);
+  });
+});
+
+describe('static UI', () => {
+  // The daemon serves the built app itself, so the operator opens one port and
+  // the browser never needs a second origin (which would need CORS, which would
+  // need a decision about who may call this API from where).
+  const uiRoot = (): string => {
+    const dir = join(home, 'ui-dist');
+    mkdirSync(join(dir, 'assets'), { recursive: true });
+    writeFileSync(join(dir, 'index.html'), '<!doctype html><div id=root></div>');
+    writeFileSync(join(dir, 'assets', 'app-deadbeef.js'), 'export{}');
+    process.env['ORCHESTRATOR_UI_DIR'] = dir;
+    return dir;
+  };
+
+  afterEach(() => delete process.env['ORCHESTRATOR_UI_DIR']);
+
+  it('serves assets with no token, because a bundle is not a secret', async () => {
+    uiRoot();
+    const res = await fetch(`${base}/assets/app-deadbeef.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/javascript');
+    expect(res.headers.get('cache-control')).toContain('immutable');
+  });
+
+  it('still refuses the API without a token', async () => {
+    // The whole point of the exemption: it moves assets out from behind the
+    // bearer and moves nothing else.
+    uiRoot();
+    expect((await fetch(`${base}/api/fleet`)).status).toBe(401);
+    expect((await fetch(`${base}/api/nope`)).status).toBe(401);
+  });
+
+  it('answers a deep link with index.html so client-side routes resolve', async () => {
+    uiRoot();
+    const res = await fetch(`${base}/jobs/abc123`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('id=root');
+    // Never cached: index.html names the hashed bundles, so a stale copy
+    // pins the browser to the previous build.
+    expect(res.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('never serves a file outside the build directory', async () => {
+    uiRoot();
+    const res = await fetch(`${base}/../../../../etc/passwd`);
+    expect(await res.text()).not.toContain('root:');
+  });
+
+  it('says the UI is not built rather than 404-ing blankly', async () => {
+    process.env['ORCHESTRATOR_UI_DIR'] = join(home, 'nothing-here');
+    const res = await fetch(`${base}/`);
+    expect(res.status).toBe(404);
+    expect((await json(res)).error).toContain('not built');
   });
 });

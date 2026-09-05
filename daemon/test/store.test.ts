@@ -128,3 +128,50 @@ describe('Store', () => {
     expect(store.listSessions().find((s) => s.sessionId === 's2')?.alive).toBe(false);
   });
 });
+
+describe('queueDepthSeries', () => {
+  it('counts a job as waiting in the hours between queueing and starting', async () => {
+    // The defect this guards: counting `job.queued` events instead of spans
+    // reports depth 0 for exactly the hours a job sat in the queue, because a
+    // waiting job emits nothing while it waits.
+    const store = await freshStore();
+    store.putJob(job({
+      id: 'slow', status: 'succeeded',
+      createdAt: '2026-09-05T09:00:00.000Z',
+      startedAt: '2026-09-05T12:00:00.000Z',
+      finishedAt: '2026-09-05T13:00:00.000Z',
+    }));
+    const by = new Map(store.queueDepthSeries('hour').map((r) => [r.bucket, r]));
+    expect(by.get('2026-09-05T09')?.waiting).toBe(1);
+    expect(by.get('2026-09-05T12')?.waiting).toBe(0);
+    expect(by.get('2026-09-05T12')?.running).toBe(1);
+    expect(by.get('2026-09-05T13')?.running).toBe(0);
+    store.close();
+  });
+
+  it('stops counting a job that was cancelled while still queued', async () => {
+    const store = await freshStore();
+    store.putJob(job({
+      id: 'killed', status: 'cancelled',
+      createdAt: '2026-09-05T09:00:00.000Z',
+      startedAt: null,
+      finishedAt: '2026-09-05T10:00:00.000Z',
+    }));
+    store.putJob(job({ id: 'later', createdAt: '2026-09-05T11:00:00.000Z', startedAt: '2026-09-05T11:30:00.000Z' }));
+    const by = new Map(store.queueDepthSeries('hour').map((r) => [r.bucket, r]));
+    expect(by.get('2026-09-05T09')?.waiting).toBe(1);
+    // Without the finished_at arm this stays 1 forever, and the chart shows a
+    // queue that never drains.
+    expect(by.get('2026-09-05T11')?.waiting).toBe(0);
+    store.close();
+  });
+
+  it('buckets by day when asked', async () => {
+    const store = await freshStore();
+    store.putJob(job({ id: 'd', createdAt: '2026-09-05T09:00:00.000Z', startedAt: '2026-09-06T09:00:00.000Z' }));
+    const rows = store.queueDepthSeries('day');
+    expect(rows.map((r) => r.bucket)).toEqual(['2026-09-05', '2026-09-06']);
+    expect(rows[0]?.waiting).toBe(1);
+    store.close();
+  });
+});

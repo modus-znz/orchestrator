@@ -1,0 +1,37 @@
+@import 'tailwindcss';
+
+/*
+ * A dark instrument panel, on purpose: this dashboard sits open next to a
+ * terminal for hours, and it reports spend and liveness rather than selling
+ * anything. One accent (sky) carries "live"; every other colour is a job
+ * state from STATUS_COLOR, so a hue always means the same thing.
+ */
+@theme {
+  --color-ink: #0b0f17;
+  --color-panel: #111826;
+  --color-edge: #1f2937;
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+}
+
+html { color-scheme: dark; }
+
+body {
+  margin: 0;
+  background: var(--color-ink);
+  color: #e2e8f0;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures everywhere a number changes in place, so a cost column does
+   not jitter sideways every time a turn lands. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #263244; border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+:where(a, button, input, select, textarea):focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}

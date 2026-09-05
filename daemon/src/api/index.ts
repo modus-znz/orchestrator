@@ -10,6 +10,7 @@ import { openTerminal, resolveTerminal } from '../terminal.js';
 import type { JobStatus } from '../types.js';
 import { loadOrMintToken, verifyBearer } from './auth.js';
 import { HttpError, Router, badRequest, conflict, forbidden, notFound, readJson, sendJson } from './http.js';
+import { serveStatic, uiDir } from './static.js';
 import { SseHub } from './sse.js';
 import { parseJobSpecs, parseSettingsPatch } from './validate.js';
 
@@ -184,6 +185,8 @@ export class ApiServer {
           // Named for what it measures, not for what a reader might assume:
           // distinct sessions active per bucket, not instantaneous parallelism.
           return sendJson(res, 200, { bucket, measure: 'distinct_active_sessions_per_bucket', series: store.concurrencySeries(bucket) });
+        case 'queue':
+          return sendJson(res, 200, { bucket, series: store.queueDepthSeries(bucket) });
         case 'tools':
           return sendJson(res, 200, { tools: store.toolUsage() });
         case 'failures':
@@ -234,10 +237,24 @@ export class ApiServer {
 
   async #dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+
+      // The UI's own assets are served unauthenticated, and only they: a
+      // bundle is public information, and the alternative — a token in the
+      // asset URLs — puts the credential in the browser's history and in
+      // every log that records a request line. The token still gates
+      // `/api/*`, so an unauthenticated caller gets the shell of an app and
+      // no data whatsoever.
+      if (!url.pathname.startsWith('/api/')) {
+        const method = req.method ?? 'GET';
+        if (method !== 'GET' && method !== 'HEAD') throw new HttpError(405, `${method} not allowed on ${url.pathname}`);
+        if (serveStatic(uiDir(), url.pathname, res, method)) return;
+        throw notFound('the web UI is not built; run `npm run build -w ui`');
+      }
+
       if (!verifyBearer(req.headers.authorization, this.#token)) {
         throw new HttpError(401, 'missing or invalid bearer token');
       }
-      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const match = this.#router.match(req.method ?? 'GET', url.pathname);
       if (!match) throw notFound(`no route for ${req.method} ${url.pathname}`);
       await match.handler({ req, res, params: match.params, query: url.searchParams });

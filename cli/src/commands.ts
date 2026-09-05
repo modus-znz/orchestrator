@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bool, list, num, str, type Parsed } from './args.js';
@@ -278,6 +278,14 @@ export async function daemon(p: Parsed): Promise<void> {
     if (!existsSync(entry)) {
       throw new Error(`daemon is not built (${entry} missing) — run \`npm run build -w @orchestrator/daemon\``);
     }
+    // The daemon creates this directory itself — but only once it is running,
+    // and the log fd and the pid file are both opened here, before the spawn.
+    // On a machine that has never run the daemon, `orc daemon start` therefore
+    // fails on ENOENT with the state directory as the missing file, which
+    // reads like a corrupt install rather than a first run.
+    // 0700 because the bearer token lives in this directory.
+    mkdirSync(orchestratorHome(), { recursive: true, mode: 0o700 });
+
     // Detached with its output on a file: a daemon whose stdout is the
     // launching terminal dies with that terminal, which is not a daemon.
     const logFile = join(orchestratorHome(), 'daemon.log');
@@ -326,4 +334,41 @@ export async function daemon(p: Parsed): Promise<void> {
   }
 
   throw new Error(`unknown: orc daemon ${action} (expected start, stop or status)`);
+}
+
+/**
+ * Open the dashboard with the token already attached.
+ *
+ * The token travels in the URL **fragment**, not the query string: browsers
+ * never put a fragment in the request line, so it reaches no access log, no
+ * `Referer` header, and no proxy we might one day put in front of the daemon.
+ * The page reads it once, stores it, and strips it from the address bar.
+ */
+export async function ui(p: Parsed): Promise<void> {
+  if (!(await health())) {
+    throw new NotRunningError(`the daemon is not running — start it with \`orc daemon start\``);
+  }
+  const url = `${baseUrl()}/#token=${readToken()}`;
+  if (bool(p.flags, 'print')) {
+    // Printing beats opening when there is no browser to open into — over ssh,
+    // or inside a session whose DISPLAY belongs to someone else.
+    out(url);
+    return;
+  }
+  const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+  const child = spawn(opener, [url], { detached: true, stdio: 'ignore' });
+  child.on('error', () => {
+    out(`could not launch ${opener}; open this yourself:`);
+    out(url);
+  });
+  child.unref();
+  out(dim(`opening ${baseUrl()}`));
+}
+
+function readToken(): string {
+  try {
+    return readFileSync(join(orchestratorHome(), 'token'), 'utf8').trim();
+  } catch {
+    throw new NotRunningError(`no token at ${join(orchestratorHome(), 'token')}`);
+  }
 }

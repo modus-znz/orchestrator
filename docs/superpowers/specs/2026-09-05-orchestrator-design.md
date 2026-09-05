@@ -341,8 +341,14 @@ orc cancel <job>
 orc steer <job> <text>
 orc attach <job> [--terminal ghostty|konsole]
 orc fleet
+orc ui                                    # open the dashboard, token in the URL fragment
 orc daemon [start|stop|status]
 ```
+
+`orc ui` is the tenth command, added during implementation. The daemon serves
+the built UI itself, so there is one port and no CORS decision to make; the
+bearer travels in the URL **fragment**, which browsers never put in a request
+line and therefore never reaches a log.
 
 ## 8. The skill
 
@@ -386,7 +392,19 @@ Views:
   allowlist, redaction patterns.
 
 Every number on every chart traces to an event in the store. No derived value
-is hand-computed in the UI.
+is hand-computed in the UI. Queue depth is a span query over `jobs`
+(`store.queueDepthSeries`), not a count of `job.queued` events — a waiting job
+emits nothing while it waits, so event counting reports zero for exactly the
+hours the queue was deepest.
+
+**Auth.** `/api/*` requires the bearer; the built assets do not, because a
+bundle is not a secret and the alternative puts the token in asset URLs. The
+browser talks to `/api/stream` with `fetch` + `ReadableStream`, not
+`EventSource`: `EventSource` cannot set an `Authorization` header, and the
+usual workaround (`?token=`) writes the credential into every request line the
+daemon or any future proxy logs. Reconnection and `Last-Event-ID` resume are
+therefore hand-rolled — about fifteen lines, and the resume logic was needed
+regardless.
 
 ## 11. Security
 

@@ -22,7 +22,9 @@ export type Bucket = 'hour' | 'day';
 
 /** Timestamps are stored as ISO-8601, so a prefix IS the bucket — no date
  *  parsing, no timezone to get wrong, and it sorts lexicographically. */
-const bucketExpr = (b: Bucket): string => (b === 'day' ? "substr(ts, 1, 10)" : "substr(ts, 1, 13)");
+/** Truncate an ISO timestamp column to its hour or day prefix. */
+const bucketOf = (b: Bucket, col: string): string => `substr(${col}, 1, ${b === 'day' ? 10 : 13})`;
+const bucketExpr = (b: Bucket): string => bucketOf(b, 'ts');
 
 const str = (v: unknown): string => String(v ?? '');
 const nstr = (v: unknown): string | null => (v == null ? null : String(v));
@@ -405,6 +407,44 @@ export class Store {
       )
       .all() as Row[];
     return rows.map((r) => ({ bucket: str(r['b']), sessions: num(r['s']), jobs: num(r['j']) }));
+  }
+
+  /**
+   * How many jobs were waiting, and how many were running, in each bucket.
+   *
+   * Queue depth is a property of an *interval*, not of an event: a job that
+   * queued at 09:00 and started at 11:00 was waiting at 10:00 even though it
+   * emitted nothing then. So this is a span query over `jobs`, not a count of
+   * `job.queued` events — counting the events would report zero for exactly
+   * the hours the queue was deepest.
+   *
+   * A job cancelled while still queued stops being counted at the bucket it
+   * finished in, which is why the waiting arm tests `finished_at` too.
+   */
+  queueDepthSeries(bucket: Bucket = 'hour'): Array<{ bucket: string; waiting: number; running: number }> {
+    const created = bucketOf(bucket, 'j.created_at');
+    const started = bucketOf(bucket, 'j.started_at');
+    const finished = bucketOf(bucket, 'j.finished_at');
+    const rows = this.#db
+      .prepare(
+        `WITH b(bucket) AS (
+           SELECT DISTINCT ${bucketOf(bucket, 'created_at')} FROM jobs
+           UNION SELECT DISTINCT ${bucketOf(bucket, 'started_at')} FROM jobs WHERE started_at IS NOT NULL
+           UNION SELECT DISTINCT ${bucketOf(bucket, 'finished_at')} FROM jobs WHERE finished_at IS NOT NULL
+         )
+         SELECT b.bucket AS bkt,
+                SUM(CASE WHEN ${created} <= b.bucket
+                          AND (j.started_at IS NULL OR ${started} > b.bucket)
+                          AND (j.finished_at IS NULL OR ${finished} > b.bucket)
+                         THEN 1 ELSE 0 END) AS waiting,
+                SUM(CASE WHEN j.started_at IS NOT NULL AND ${started} <= b.bucket
+                          AND (j.finished_at IS NULL OR ${finished} > b.bucket)
+                         THEN 1 ELSE 0 END) AS running
+           FROM b LEFT JOIN jobs j
+          GROUP BY b.bucket ORDER BY b.bucket`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({ bucket: str(r['bkt']), waiting: num(r['waiting']), running: num(r['running']) }));
   }
 
   /** Which tools the fleet actually reaches for. */
