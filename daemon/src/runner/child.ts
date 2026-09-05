@@ -11,6 +11,9 @@ export interface RunOptions {
   readonly claudeBin?: string;
   /** Grace period between SIGTERM and SIGKILL. */
   readonly killGraceMs?: number;
+  /** How long to wait after the child exits for its stdio to close before
+   *  giving up on the tail of the stream. */
+  readonly stdioGraceMs?: number;
 }
 
 export interface RunHandle {
@@ -73,6 +76,7 @@ export class ChildRunner {
     const errSplitter = new LineSplitter();
     const bin = this.#opts.claudeBin ?? 'claude';
     const graceMs = this.#opts.killGraceMs ?? 5_000;
+    const stdioGraceMs = this.#opts.stdioGraceMs ?? 2_000;
 
     this.#bus.publish({
       jobId: job.id,
@@ -88,6 +92,12 @@ export class ChildRunner {
       // stdin at EOF, or the CLI blocks 3 seconds waiting for input (F12).
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
+      // Its own process group. Claude Code spawns subprocesses of its own
+      // (every Bash tool call is one), and signalling only the parent leaves
+      // those grandchildren alive — holding the stdout pipe open, so 'close'
+      // never fires and the job hangs in 'running'. Killing the group is the
+      // only way to actually stop the tree.
+      detached: true,
     });
 
     let estimatedUsd = 0;
@@ -96,14 +106,30 @@ export class ChildRunner {
     let error: string | null = null;
     let settled = false;
 
+    /** Signal the whole process group, falling back to the bare child if the
+     *  group is already gone (ESRCH) or the platform refuses. */
+    const signalTree = (signal: NodeJS.Signals): void => {
+      const pid = child.pid;
+      if (pid === undefined) return;
+      try {
+        process.kill(-pid, signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // Already reaped; nothing left to signal.
+        }
+      }
+    };
+
     const terminate = (why: RunOutcome['status'], message: string): void => {
       if (settled) return;
       settled = true;
       outcome = why;
       error = message;
-      child.kill('SIGTERM');
+      signalTree('SIGTERM');
       setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        if (child.exitCode === null && child.signalCode === null) signalTree('SIGKILL');
       }, graceMs).unref();
     };
 
@@ -169,7 +195,11 @@ export class ChildRunner {
     });
 
     const done = new Promise<RunOutcome>((resolve) => {
+      let finished = false;
       const finish = (exitCode: number | null): void => {
+        // 'exit' and 'close' both route here, and either may arrive first.
+        if (finished) return;
+        finished = true;
         clearTimeout(timer);
         for (const line of splitter.flush()) handleLine(line);
         const costUsd = authoritativeUsd ?? estimatedUsd;
@@ -200,7 +230,14 @@ export class ChildRunner {
         }
         finish(null);
       });
+      // 'close' is preferred — it means stdio reached EOF, so the last line of
+      // the stream has certainly been read. But it can never arrive if an
+      // orphaned grandchild still holds the pipe, so 'exit' arms a bounded
+      // wait and then closes the job out regardless.
       child.on('close', (code) => finish(code));
+      child.on('exit', (code) => {
+        setTimeout(() => finish(code), stdioGraceMs).unref();
+      });
     });
 
     return {

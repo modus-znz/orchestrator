@@ -58,6 +58,8 @@ one constrains the design; the citation is so a future reader can re-run it.
 | F13 | Authoritative cost appears exactly once, in the terminal `result` as `total_cost_usd` (plus `modelUsage` per model). `assistant` events carry token `usage` but no money. | Same capture. |
 | F14 | One API response can arrive as **several** `assistant` events sharing a single `message.id`, each repeating identical `usage`. Naive per-event summing double-counts. | Same capture: two events, same id, `usage` identical. |
 | F15 | `system`/`init` carries `claude_code_version`, `model`, `cwd`, `permissionMode`, `messaging_socket_path`. `result` carries `permission_denials`, `num_turns`, `duration_ms`. | Same capture. |
+| F16 | `--session-id <uuid>` is **accepted and honoured**: a pre-minted uuid comes back verbatim in every `session_id` field, exit 0. The job→session join therefore exists before the child produces a byte. |
+| F17 | A killed child's `'close'` can never arrive while an orphaned grandchild holds the stdout pipe. Claude Code spawns subprocesses of its own, so the child must be spawned `detached` and signalled as a **process group**, with `'exit'` arming a bounded wait for `'close'`. |
 
 ## 3. Architecture
 
@@ -336,8 +338,15 @@ This box runs arbitrary Bash and keeps `hash.env` on the Desktop. Therefore:
 - Hard budget caps with automatic kill. Budgets are **USD, per job**, checked
   against accumulated `cost.turn` events after every turn; breaching one emits
   `job.budget_exceeded` and SIGTERMs the child. Mid-run the check uses the
-  estimate (§4.5); it is a kill switch, not a billing record. A runaway loop costs bounded
-  money by construction, not by vigilance.
+  estimate (§4.5); it is a kill switch, not a billing record. **The bound is the
+  cap plus one turn's overshoot**, not the cap: a turn's cost is only known once
+  its `assistant` event arrives, which is after the tool calls it paid for. A
+  runaway *loop* is therefore bounded by construction, but a single enormous
+  turn can exceed the cap once before the kill lands.
+- Children are spawned `detached` and killed as a **process group** (F17).
+  Signalling only the parent leaves Claude Code's own subprocesses running —
+  which both burns money after a "kill" and holds the stdout pipe open, hanging
+  the job in `running`.
 - Steering opt-in, off by default (§6).
 - The repo `.gitignore`s `*.db`, `events.jsonl`, `token`, `redact.txt` — the
   code is shareable, the captured session data is not.
