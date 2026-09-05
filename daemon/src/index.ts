@@ -3,6 +3,7 @@ import { ApiServer } from './api/index.js';
 import { EventBus } from './bus.js';
 import { Courier } from './courier/index.js';
 import { paths } from './paths.js';
+import { reconcile } from './reconcile.js';
 import { RegistryWatcher } from './registry/watcher.js';
 import { ChildRunner } from './runner/child.js';
 import { Scheduler } from './scheduler/index.js';
@@ -32,6 +33,8 @@ function loadRedactPatterns(): string[] {
 
 export interface Daemon {
   readonly port: number;
+  /** Jobs settled at startup from a previous unclean shutdown. */
+  readonly reconciled: { vanished: string[]; orphaned: string[] };
   readonly stop: () => Promise<void>;
 }
 
@@ -52,6 +55,12 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Daemon> {
   const courier = new Courier(bus);
   const watcher = new RegistryWatcher(store, bus, { isEphemeral: courier.isEphemeral });
   const api = new ApiServer({ store, bus, scheduler, courier, watcher });
+
+  // Before anything can schedule: a previous daemon that was killed rather
+  // than stopped left `running` rows behind, and those rows count against
+  // maxConcurrency. Settling them is the difference between a restart that
+  // works and one that quietly never starts another job.
+  const settled = reconcile(store, bus);
 
   watcher.start();
   const ticker = setInterval(() => scheduler.tick(), TICK_MS);
@@ -78,16 +87,23 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Daemon> {
     });
   }
 
-  return { port: bound, stop };
+  return { port: bound, reconciled: settled, stop };
 }
 
 // Only when run directly, so importing the daemon in a test does not start one.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env['ORCHESTRATOR_PORT'] ?? DEFAULT_PORT);
   startDaemon(Number.isFinite(port) ? port : DEFAULT_PORT)
-    .then(({ port: bound }) => {
+    .then(({ port: bound, reconciled }) => {
       process.stdout.write(`orchestratord listening on http://127.0.0.1:${bound}\n`);
       process.stdout.write(`token: ${paths.token}\n`);
+      const stale = reconciled.vanished.length + reconciled.orphaned.length;
+      if (stale > 0) {
+        process.stdout.write(
+          `settled ${stale} job(s) from an unclean shutdown ` +
+            `(${reconciled.orphaned.length} still running, terminated)\n`,
+        );
+      }
     })
     .catch((err: unknown) => {
       process.stderr.write(`orchestratord failed to start: ${String(err)}\n`);

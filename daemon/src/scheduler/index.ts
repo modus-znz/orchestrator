@@ -164,6 +164,7 @@ export class Scheduler {
         sessionId: outcome.sessionId,
         finishedAt: new Date().toISOString(),
         costUsd: outcome.costUsd,
+        numTurns: outcome.numTurns,
         exitCode: outcome.exitCode,
         error: outcome.error,
       });

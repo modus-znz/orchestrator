@@ -23,7 +23,7 @@ class FakeRunner {
   }
 
   async finish(jobId: string, status: RunOutcome['status'] = 'succeeded'): Promise<void> {
-    this.#settle.get(jobId)?.({ status, exitCode: 0, costUsd: 0.01, sessionId: `sess-${jobId}`, error: null });
+    this.#settle.get(jobId)?.({ status, exitCode: 0, costUsd: 0.01, sessionId: `sess-${jobId}`, error: null, numTurns: 2 });
     this.#settle.delete(jobId);
     await new Promise((r) => setImmediate(r));
   }

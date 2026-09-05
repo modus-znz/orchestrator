@@ -29,6 +29,8 @@ export interface RunOutcome {
   readonly costUsd: number;
   readonly sessionId: string;
   readonly error: string | null;
+  /** As reported by the child's own result line; 0 if it never got that far. */
+  readonly numTurns: number;
 }
 
 export function buildArgs(job: JobRecord, sessionId: string, opts: RunOptions = {}): string[] {
@@ -105,6 +107,10 @@ export class ChildRunner {
     let outcome: RunOutcome['status'] = 'failed';
     let error: string | null = null;
     let settled = false;
+    /** Whether the child published its own terminal event, which decides
+     *  whether the runner still owes the log a closing one. */
+    let childAnnounced = false;
+    let numTurns = 0;
 
     /** Signal the whole process group, falling back to the bare child if the
      *  group is already gone (ESRCH) or the platform refuses. */
@@ -146,8 +152,18 @@ export class ChildRunner {
           estimatedUsd += p.usd ?? 0;
         }
         if (event.type === 'job.finished' || event.type === 'job.failed') {
-          const p = event.payload as { costUsd?: number | null; error?: string | null };
+          const p = event.payload as {
+            costUsd?: number | null;
+            error?: string | null;
+            numTurns?: number | null;
+          };
           if (typeof p.costUsd === 'number') authoritativeUsd = p.costUsd;
+          if (typeof p.numTurns === 'number') numTurns = p.numTurns;
+          // The child has announced its own outcome. The runner's closing
+          // event exists to cover the case where it never does, so publishing
+          // one now would put two terminal events on the same job — which
+          // double-counts in any chart that groups by event type.
+          childAnnounced = true;
           if (!settled) {
             settled = true;
             outcome = event.type === 'job.finished' ? 'succeeded' : 'failed';
@@ -208,18 +224,22 @@ export class ChildRunner {
           : outcome === 'cancelled' ? 'job.cancelled'
           : outcome === 'budget_exceeded' ? 'job.budget_exceeded'
           : 'job.failed';
-        // A closing event always lands, even when the child died without
-        // emitting a result — otherwise a killed job would hang in 'running'
-        // forever in both the DB and the dashboard.
-        this.#bus.publish({
-          jobId: job.id,
-          sessionId: parser.sessionId,
-          ts: new Date().toISOString(),
-          source: 'child',
-          type,
-          payload: { exitCode, costUsd, estimated: authoritativeUsd === null, error, final: true },
-        });
-        resolve({ status: outcome, exitCode, costUsd, sessionId: parser.sessionId, error });
+        // A closing event lands whenever the child did NOT announce one
+        // itself — otherwise a killed job would hang in 'running' forever in
+        // both the DB and the dashboard. A cancel or a budget kill still needs
+        // one even after the child spoke, because the child's word was
+        // 'finished' and the truth is that we stopped it.
+        if (!childAnnounced || outcome === 'cancelled' || outcome === 'budget_exceeded') {
+          this.#bus.publish({
+            jobId: job.id,
+            sessionId: parser.sessionId,
+            ts: new Date().toISOString(),
+            source: 'child',
+            type,
+            payload: { exitCode, costUsd, estimated: authoritativeUsd === null, error, final: true },
+          });
+        }
+        resolve({ status: outcome, exitCode, costUsd, sessionId: parser.sessionId, error, numTurns });
       };
 
       child.on('error', (err) => {
