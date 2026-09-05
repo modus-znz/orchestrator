@@ -36,6 +36,7 @@ export type EventType =
   | 'session.state'
   | 'steer.sent'
   | 'steer.failed'
+  | 'rate.limit'
   | 'raw';
 
 export interface OrchestratorEvent {

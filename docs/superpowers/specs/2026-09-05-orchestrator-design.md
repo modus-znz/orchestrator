@@ -54,6 +54,10 @@ one constrains the design; the citation is so a future reader can re-run it.
 | F9 | Harness state can contain plaintext secrets. `jobs/0c762231/adopt.json` held a live `DATABASE_URL`, `SESSION_SECRET`, and `ADMIN_PASSWORD` inside a captured command string. | Direct read. |
 | F10 | Model tier is a real cost lever: 5.8x Opus:Haiku on an identical trivial prompt ($0.274 vs $0.047). | Two probe runs. |
 | F11 | Node 24.15.0 is installed, so `node:sqlite` is built in — no `better-sqlite3`, no native build step. | `node -v`. |
+| F12 | `stream-json` stdout is **not** JSON-per-line: the CLI can emit a plaintext warning first (`Warning: no stdin data received in 3s`). It also *blocks 3 seconds* waiting on stdin unless stdin is already at EOF. | Captured stream, line 1. |
+| F13 | Authoritative cost appears exactly once, in the terminal `result` as `total_cost_usd` (plus `modelUsage` per model). `assistant` events carry token `usage` but no money. | Same capture. |
+| F14 | One API response can arrive as **several** `assistant` events sharing a single `message.id`, each repeating identical `usage`. Naive per-event summing double-counts. | Same capture: two events, same id, `usage` identical. |
+| F15 | `system`/`init` carries `claude_code_version`, `model`, `cwd`, `permissionMode`, `messaging_socket_path`. `result` carries `permission_denials`, `num_turns`, `duration_ms`. | Same capture. |
 
 ## 3. Architecture
 
@@ -179,6 +183,26 @@ tier. Patterns: `*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY`, `DATABASE_URL`,
 contents of `~/.claude/orchestrator/redact.txt` (a user-editable literal list).
 Redaction happens at ingest, so the on-disk log never holds the secret — not at
 render, which would leave it on disk forever.
+
+### 4.5 Cost accounting
+
+F13 forces a two-stage design, because budget enforcement must act *during* a
+run while the only trustworthy number arrives at the *end* of it.
+
+- **During the run:** each distinct `message.id` (F14) yields one `cost.turn`
+  carrying token usage and a USD figure **estimated** from a price table in
+  settings. Cache writes are charged above plain input and cache reads below
+  it. An unrecognised model prices as the most expensive tier, so an unknown
+  model kills early — stopping a job early is a far cheaper mistake than
+  failing to stop a runaway one.
+- **At the end:** `result.total_cost_usd` overwrites the accumulated estimate.
+  The stored cost for a finished job is always the authoritative figure.
+
+Estimated values are flagged `estimated: true` in the event payload, and the UI
+labels a running job's cost as an estimate rather than presenting it as fact.
+
+F12 additionally requires that children are spawned with **stdin already at
+EOF**, or every job pays a silent 3-second startup tax.
 
 ## 5. orchestratord
 
@@ -311,7 +335,8 @@ This box runs arbitrary Bash and keeps `hash.env` on the Desktop. Therefore:
 - Redaction at ingest (§4.4), on the evidence of F9.
 - Hard budget caps with automatic kill. Budgets are **USD, per job**, checked
   against accumulated `cost.turn` events after every turn; breaching one emits
-  `job.budget_exceeded` and SIGTERMs the child. A runaway loop costs bounded
+  `job.budget_exceeded` and SIGTERMs the child. Mid-run the check uses the
+  estimate (§4.5); it is a kill switch, not a billing record. A runaway loop costs bounded
   money by construction, not by vigilance.
 - Steering opt-in, off by default (§6).
 - The repo `.gitignore`s `*.db`, `events.jsonl`, `token`, `redact.txt` — the
