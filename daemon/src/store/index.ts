@@ -18,6 +18,12 @@ import {
 
 type Row = Record<string, unknown>;
 
+export type Bucket = 'hour' | 'day';
+
+/** Timestamps are stored as ISO-8601, so a prefix IS the bucket — no date
+ *  parsing, no timezone to get wrong, and it sorts lexicographically. */
+const bucketExpr = (b: Bucket): string => (b === 'day' ? "substr(ts, 1, 10)" : "substr(ts, 1, 13)");
+
 const str = (v: unknown): string => String(v ?? '');
 const nstr = (v: unknown): string | null => (v == null ? null : String(v));
 const num = (v: unknown): number => Number(v ?? 0);
@@ -113,6 +119,13 @@ export class Store {
     for (const r of this.#db.prepare('SELECT session_id, MAX(seq) AS m FROM events GROUP BY session_id').all() as Row[]) {
       this.#seq.set(str(r['session_id']), num(r['m']) + 1);
     }
+  }
+
+  /** Whether close() has run. The bus consults this: a child can settle after
+   *  shutdown has closed the store, and crashing on the way out is a poor way
+   *  to report that there was nowhere left to write. */
+  get closed(): boolean {
+    return this.#closed;
   }
 
   nextSeq(sessionId: string): number {
@@ -328,6 +341,104 @@ export class Store {
       this.#db.prepare('UPDATE sessions SET alive = 0 WHERE session_id = ?').run(id);
     }
     return gone;
+  }
+
+  /**
+   * When this session was last steered, as epoch millis, newest first.
+   *
+   * Failed deliveries count. The rate limit exists because couriers cost real
+   * money (§14) and a courier that failed spent it just the same — a limit that
+   * only counted successes would be uncapped in exactly the situation where
+   * something is going wrong.
+   */
+  recentSteerTimes(sessionId: string, sinceIso: string): number[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT ts FROM events
+          WHERE session_id = ? AND ts >= ? AND type IN ('steer.sent', 'steer.failed')
+          ORDER BY id DESC`,
+      )
+      .all(sessionId, sinceIso) as Row[];
+    return rows.map((r) => Date.parse(str(r['ts']))).filter((t) => Number.isFinite(t));
+  }
+
+  // ---- stats ------------------------------------------------------------
+
+  /** Spend per time bucket, for the cost chart. */
+  costSeries(bucket: Bucket = 'hour'): Array<{ bucket: string; usd: number; inputTokens: number; outputTokens: number }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT ${bucketExpr(bucket)} AS b, SUM(usd) AS usd,
+                SUM(input_tokens) AS inp, SUM(output_tokens) AS outp
+           FROM costs GROUP BY b ORDER BY b`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({
+      bucket: str(r['b']),
+      usd: num(r['usd']),
+      inputTokens: num(r['inp']),
+      outputTokens: num(r['outp']),
+    }));
+  }
+
+  costByModel(): Array<{ model: string; usd: number; turns: number }> {
+    const rows = this.#db
+      .prepare('SELECT model, SUM(usd) AS usd, COUNT(*) AS n FROM costs GROUP BY model ORDER BY usd DESC')
+      .all() as Row[];
+    return rows.map((r) => ({ model: str(r['model']), usd: num(r['usd']), turns: num(r['n']) }));
+  }
+
+  /**
+   * Distinct sessions active per bucket.
+   *
+   * Deliberately not "instantaneous concurrency", which the event log cannot
+   * answer without reconstructing every session's lifetime. This is the honest
+   * measure the data supports, and the chart is labelled as such rather than
+   * implying a precision that is not there.
+   */
+  concurrencySeries(bucket: Bucket = 'hour'): Array<{ bucket: string; sessions: number; jobs: number }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT ${bucketExpr(bucket)} AS b, COUNT(DISTINCT session_id) AS s,
+                COUNT(DISTINCT job_id) AS j
+           FROM events GROUP BY b ORDER BY b`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({ bucket: str(r['b']), sessions: num(r['s']), jobs: num(r['j']) }));
+  }
+
+  /** Which tools the fleet actually reaches for. */
+  toolUsage(limit = 25): Array<{ tool: string; uses: number }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT COALESCE(json_extract(payload, '$.name'), 'unknown') AS tool, COUNT(*) AS n
+           FROM events WHERE type = 'tool.use'
+          GROUP BY tool ORDER BY n DESC LIMIT ?`,
+      )
+      .all(limit) as Row[];
+    return rows.map((r) => ({ tool: str(r['tool']), uses: num(r['n']) }));
+  }
+
+  /** Terminal job outcomes, plus the errors behind the failures. */
+  failureStats(limit = 20): { byStatus: Array<{ status: string; count: number }>; recent: Array<{ id: string; name: string; error: string | null; finishedAt: string | null }> } {
+    const byStatus = (
+      this.#db.prepare('SELECT status, COUNT(*) AS n FROM jobs GROUP BY status').all() as Row[]
+    ).map((r) => ({ status: str(r['status']), count: num(r['n']) }));
+    const recent = (
+      this.#db
+        .prepare(
+          `SELECT id, name, error, finished_at FROM jobs
+            WHERE status IN ('failed', 'budget_exceeded', 'cancelled')
+            ORDER BY finished_at DESC LIMIT ?`,
+        )
+        .all(limit) as Row[]
+    ).map((r) => ({
+      id: str(r['id']),
+      name: str(r['name'] ?? ''),
+      error: nstr(r['error']),
+      finishedAt: nstr(r['finished_at']),
+    }));
+    return { byStatus, recent };
   }
 
   // ---- settings ---------------------------------------------------------

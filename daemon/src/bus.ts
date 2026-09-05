@@ -19,6 +19,11 @@ export class EventBus {
   }
 
   publish(event: UnsequencedEvent): StoredEvent {
+    // Shutdown drains before it closes, so this is a race and not the normal
+    // path — but a child that settles a millisecond late must not take the
+    // process down with it. There is genuinely nowhere to record this: the
+    // JSONL log closed with the store.
+    if (this.#store.closed) return { ...event, seq: -1, id: 0 };
     const literals = this.#store.getSettings().redactPatterns;
     const full: OrchestratorEvent = {
       ...event,

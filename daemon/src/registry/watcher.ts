@@ -57,6 +57,11 @@ export interface WatcherOptions {
   readonly proc?: ProcTable;
   readonly intervalMs?: number;
   readonly now?: () => Date;
+  /** Suppress a pid from the fleet entirely. Used for the daemon's own
+   *  couriers (F3): they are real sessions, but treating a four-second mail
+   *  slot as a fleet member means the log records a session arriving and
+   *  departing every time an operator steers. */
+  readonly isEphemeral?: (pid: number) => boolean;
 }
 
 /**
@@ -78,6 +83,7 @@ export class RegistryWatcher {
   readonly #proc: ProcTable;
   readonly #intervalMs: number;
   readonly #now: () => Date;
+  readonly #isEphemeral: (pid: number) => boolean;
   /** sessionIds this watcher has already announced, so `scan` is idempotent. */
   readonly #announced = new Set<string>();
   #timer: NodeJS.Timeout | null = null;
@@ -89,6 +95,7 @@ export class RegistryWatcher {
     this.#proc = opts.proc ?? linuxProc;
     this.#intervalMs = opts.intervalMs ?? 2000;
     this.#now = opts.now ?? (() => new Date());
+    this.#isEphemeral = opts.isEphemeral ?? (() => false);
   }
 
   start(): void {
@@ -113,6 +120,7 @@ export class RegistryWatcher {
     for (const entry of this.#listFiles()) {
       const file = parse(entry);
       if (!file) continue;
+      if (this.#isEphemeral(file.pid)) continue;
       // Liveness, not existence. Both halves matter: a missing start time means
       // the process is gone, a differing one means the pid was recycled.
       const started = this.#proc.startTime(file.pid);

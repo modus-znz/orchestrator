@@ -155,6 +155,11 @@ export function judge(result: CourierResult | null, exitCode: number | null): De
 export class Courier {
   readonly #bus: EventBus;
   readonly #opts: Required<CourierOptions>;
+  /** Pids of couriers currently running. A courier is a real Claude session
+   *  and registers itself like any other (F3), so without this the fleet view
+   *  sprouts a session every time someone steers and loses it four seconds
+   *  later — noise that is not a member of the fleet in any useful sense. */
+  readonly #livePids = new Set<number>();
 
   constructor(bus: EventBus, opts: CourierOptions = {}) {
     this.#bus = bus;
@@ -165,6 +170,9 @@ export class Courier {
       killGraceMs: opts.killGraceMs ?? 3_000,
     };
   }
+
+  /** Whether this pid is a courier of ours, for the registry watcher's filter. */
+  isEphemeral = (pid: number): boolean => this.#livePids.has(pid);
 
   async deliver(req: DeliveryRequest): Promise<DeliveryResult> {
     const nonce = `===STEER-${Math.random().toString(36).slice(2, 10).toUpperCase()}===`;
@@ -202,6 +210,7 @@ export class Courier {
       // F12: the CLI blocks three seconds waiting on stdin unless it is already
       // at EOF. A courier has nothing to say on stdin, so close it immediately.
       child.stdin?.end();
+      if (child.pid !== undefined) this.#livePids.add(child.pid);
 
       const splitter = new LineSplitter();
       let result: CourierResult | null = null;
@@ -224,6 +233,7 @@ export class Courier {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (child.pid !== undefined) this.#livePids.delete(child.pid);
         readLines(splitter.flush());
         if (timedOut) {
           resolve({
@@ -251,6 +261,7 @@ export class Courier {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (child.pid !== undefined) this.#livePids.delete(child.pid);
         resolve({ delivered: false, costUsd: 0, error: `courier failed to spawn: ${err.message}` });
       });
       // F17 again: 'close' waits for stdio EOF, which an orphaned grandchild

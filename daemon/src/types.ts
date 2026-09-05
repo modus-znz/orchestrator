@@ -174,6 +174,12 @@ export interface Settings {
   /** Max steers per session per hour; couriers cost real money (§14). */
   readonly steerRateLimitPerHour: number;
   readonly redactPatterns: readonly string[];
+  /** Whether the API may accept `permissionMode: 'bypassPermissions'`.
+   *  Closed by default: this daemon is designed to become remotely reachable
+   *  (§11), and a route that spawns an agent with permission prompts disabled
+   *  is the most dangerous capability in the system. The operator opts in on
+   *  the box, not through the UI they reached from elsewhere. */
+  readonly allowBypassPermissions: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -187,4 +193,5 @@ export const DEFAULT_SETTINGS: Settings = {
   steerAllowlist: [],
   steerRateLimitPerHour: 20,
   redactPatterns: [],
+  allowBypassPermissions: false,
 };
