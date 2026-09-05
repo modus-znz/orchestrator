@@ -178,7 +178,7 @@ interface Event {
   sessionId: string;
   seq: number;               // monotonic per sessionId
   ts: string;                // ISO 8601
-  source: 'child' | 'registry' | 'harness';
+  source: 'child' | 'registry' | 'harness' | 'api';
   type: EventType;
   payload: unknown;          // discriminated on type
 }
@@ -195,6 +195,22 @@ type EventType =
 
 `seq` is assigned by the daemon on ingest, not by the source, so ordering
 survives a source that has no sequence of its own (registry files do not).
+
+`source` says which half of the system observed the event, and it is a
+provenance field rather than a category: `child` is a job's own stdout,
+`registry` is the fleet watcher, and `api` is the daemon acting on an
+operator's request — `job.queued` at submit, and a settings change. That
+distinction matters on replay, where an `api` event is the only record of
+something no child ever printed.
+
+`job.queued` is published by `Scheduler.submit()`, at the moment a job
+actually becomes queued, and never by the spawn path. A job that is submitted
+and never scheduled — the queue is full, or a dependency never lands — must
+still appear in the log, because `rebuildFromLogs` reseeds the jobs table from
+exactly these events and would otherwise drop the whole pending queue on a
+schema upgrade. Its `sessionId` is the job id, since no session exists yet and
+the event schema has no null to offer; replay reads the spec off the payload
+and never off that field.
 
 ### 4.3 Storage
 

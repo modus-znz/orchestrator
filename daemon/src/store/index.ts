@@ -279,11 +279,16 @@ export class Store {
   /**
    * A job's transcript from `fromSeq` onward.
    *
-   * `seq` is the right cursor here and only here: a job's events all belong to
-   * one session at a time. A job that was resumed or forked spans more than one
-   * sessionId, each with its own `seq` restarting at zero — so the rows are
-   * ordered by the fleet-wide `id`, and `fromSeq` filters within them rather
-   * than ordering them.
+   * Ordered by the fleet-wide `id`, never by `seq`, because a job's events do
+   * not share one seq namespace. Every job has at least two: `job.queued` is
+   * published before a session exists and so carries the job id as its
+   * sessionId, and the child's own events then start their own numbering at
+   * zero. A job that was resumed or forked adds one namespace per session.
+   *
+   * `fromSeq` therefore filters within an already-ordered set rather than
+   * ordering it. It is sound as a cursor only because the job-id namespace
+   * holds the leading event (and the trailing one, for a job cancelled before
+   * it ever started) — both callers pass 0 today.
    */
   eventsForJob(jobId: string, fromSeq = 0): StoredEvent[] {
     const rows = this.#db
