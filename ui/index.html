@@ -1,10 +1,21 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark light" />
+    <meta name="color-scheme" content="light dark" />
     <title>orchestrator</title>
+    <script>
+      // Applied before first paint. Reading the stored theme from React instead
+      // would repaint the page white on every dark-mode load — a flash on every
+      // single visit, which is the one bug a theme toggle must not ship with.
+      try {
+        var t = localStorage.getItem('orc.theme');
+        if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+      } catch (e) {
+        /* private mode or blocked site data — the light default already stands */
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

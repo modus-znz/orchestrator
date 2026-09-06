@@ -1,9 +1,11 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { api, ApiError, setToken } from './lib/api';
 import { clearToken, loadToken, saveToken } from './lib/token';
 import { useEventStream } from './lib/hooks';
 import { Nav } from './components/Nav';
+import { KpiStrip } from './components/KpiStrip';
+import { ThemeProvider, useTheme } from './lib/theme';
 import { TokenGate } from './components/TokenGate';
 import { Fleet } from './views/Fleet';
 import { Jobs } from './views/Jobs';
@@ -15,7 +17,7 @@ const Graphs = lazy(() => import('./views/Graphs').then((m) => ({ default: m.Gra
 const JobDetail = lazy(() => import('./views/JobDetail').then((m) => ({ default: m.JobDetail })));
 import type { Health } from './lib/types';
 
-export function App() {
+function AppInner() {
   const [token, setTok] = useState<string | null>(() => loadToken());
   const [authError, setAuthError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
@@ -85,6 +87,7 @@ const Lazy = ({ children }: { children: React.ReactNode }) => (
 );
 
 function Shell({ onSignOut }: { onSignOut: () => void }) {
+  useHotkeys();
   const [from, setFrom] = useState<number | null>(null);
   useEffect(() => {
     api<Health>('/api/health')
@@ -108,7 +111,14 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
 
   return (
     <>
-      {nav}
+      {/* Nav and KPI strip stick as one block. A separately-sticky strip needs
+          a hardcoded offset equal to the nav's height, and the nav's height
+          moves with zoom, font scale and the wrapped mobile row — so the
+          offset is wrong exactly when someone changes their type size. */}
+      <div className="sticky top-0 z-10">
+        {nav}
+        <KpiStrip tick={tick} />
+      </div>
       <main className="mx-auto max-w-7xl px-3 py-4 sm:px-5 sm:py-6">
         <Routes>
           <Route path="/" element={<Fleet tick={tick} />} />
@@ -123,5 +133,64 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
         </Routes>
       </main>
     </>
+  );
+}
+
+/**
+ * Keyboard navigation: `g` then 1-4 for the four views, `t` for the theme,
+ * `/` to jump into whatever the current view uses for search.
+ *
+ * The `g` prefix rather than bare digits, because a bare single-letter shortcut
+ * fires while someone is typing a steer into a textarea. Anything typed into a
+ * field is ignored outright for the same reason.
+ */
+function useHotkeys(): void {
+  const navigate = useNavigate();
+  const { toggle } = useTheme();
+  const pending = useRef(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      const el = e.target as HTMLElement | null;
+      const typing =
+        !!el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (e.key === '/' && !typing) {
+        const box = document.querySelector<HTMLInputElement>('input[type=search]');
+        if (box) {
+          e.preventDefault();
+          box.focus();
+        }
+        return;
+      }
+      if (typing) return;
+
+      if (pending.current) {
+        pending.current = false;
+        const to = { '1': '/', '2': '/jobs', '3': '/graphs', '4': '/settings' }[e.key];
+        if (to) {
+          e.preventDefault();
+          navigate(to);
+        }
+        return;
+      }
+      if (e.key === 'g') {
+        pending.current = true;
+        setTimeout(() => (pending.current = false), 1200);
+      } else if (e.key === 't') {
+        toggle();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [navigate, toggle]);
+}
+
+export function App() {
+  return (
+    <ThemeProvider>
+      <AppInner />
+    </ThemeProvider>
   );
 }

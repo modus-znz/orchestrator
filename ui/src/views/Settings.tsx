@@ -109,7 +109,7 @@ export function Settings() {
         <button
           onClick={() => void save()}
           disabled={saving}
-          className="rounded-lg bg-sky-500/90 px-4 py-2 text-sm font-medium text-slate-950 hover:bg-sky-400 disabled:opacity-40"
+          className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-ink transition-opacity hover:opacity-90 disabled:opacity-40"
         >
           {saving ? 'Saving…' : 'Save settings'}
         </button>

@@ -1,37 +1,179 @@
 @import 'tailwindcss';
 
-/*
- * A dark instrument panel, on purpose: this dashboard sits open next to a
- * terminal for hours, and it reports spend and liveness rather than selling
- * anything. One accent (sky) carries "live"; every other colour is a job
- * state from STATUS_COLOR, so a hue always means the same thing.
- */
+/* ---------------------------------------------------------------------------
+ * Mchuzi Suite house type, self-hosted.
+ *
+ * Self-hosted rather than pulled from Google Fonts because this dashboard is a
+ * loopback tool that must render correctly with no network at all. The seven
+ * faces are copied into src/fonts/ and Vite fingerprints them into dist/assets;
+ * the daemon already maps .woff2 to font/woff2, so they serve with a real
+ * content-type rather than falling back to system-ui the way a relative path
+ * with no files silently would.
+ * ------------------------------------------------------------------------- */
+@font-face { font-family: 'Lato'; src: url('./fonts/Lato-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Lato'; src: url('./fonts/Lato-Bold.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Lato'; src: url('./fonts/Lato-Black.woff2') format('woff2'); font-weight: 900; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Open Sans'; src: url('./fonts/OpenSans-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Open Sans'; src: url('./fonts/OpenSans-SemiBold.woff2') format('woff2'); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Source Sans 3'; src: url('./fonts/SourceSans3-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Source Sans 3'; src: url('./fonts/SourceSans3-SemiBold.woff2') format('woff2'); font-weight: 600; font-style: normal; font-display: swap; }
+
+/* ---------------------------------------------------------------------------
+ * Theme: light by default, dark on demand.
+ *
+ * The trick that keeps this small: Tailwind v4 compiles `text-slate-300` to
+ * `color: var(--color-slate-300)`, so re-pointing the slate ramp themes every
+ * one of the ~200 utility classes already written across the views without
+ * touching a single one of them. The ramp is used *semantically* here — 100 is
+ * the loudest text, 600 the quietest — so light mode inverts the direction of
+ * the ramp rather than swapping in a different palette. Anything written later
+ * with slate classes themes itself for free.
+ *
+ * @theme carries the light values, so light is genuinely the default rather
+ * than dark-with-an-override. No colour is defined only inside the dark block.
+ * ------------------------------------------------------------------------- */
 @theme {
+  /* Surfaces */
+  --color-ink: #f4f6f9;
+  --color-panel: #ffffff;
+  --color-edge: #e2e8f0;
+
+  /* Text ramp, loudest to quietest */
+  --color-slate-100: #0f172a;
+  --color-slate-200: #1e293b;
+  --color-slate-300: #334155;
+  --color-slate-400: #475569;
+  --color-slate-500: #64748b;
+  --color-slate-600: #94a3b8;
+  --color-slate-700: #cbd5e1;
+
+  /* Accents that appear as *text* need real contrast on a light ground; the
+     300/400 tints were chosen against #0b0f17 and turn to fog on white. */
+  --color-accent: #0284c7;
+  --color-accent-ink: #ffffff;
+  --color-sky-300: #0369a1;
+  --color-sky-400: #0284c7;
+  --color-red-300: #b91c1c;
+  --color-red-400: #dc2626;
+  --color-red-500: #dc2626;
+  --color-green-300: #15803d;
+  --color-green-400: #16a34a;
+  --color-amber-300: #b45309;
+  --color-amber-400: #d97706;
+  --color-purple-300: #7e22ce;
+
+  /* Mchuzi Suite type tokens — referenced only through these names, never a
+     family name in a component. */
+  --font-display: 'Lato', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: 'Open Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-num: 'Source Sans 3', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+}
+
+/* Chrome that sits outside the utility system. Defined per theme so nothing
+   survives a theme switch as an artefact of the other one. */
+:root {
+  /* One dial. 16px: this is a dense data surface, not a reading surface.
+     Kept out of @theme deliberately — Tailwind turns every --font-* there into
+     a font-family utility, and a `.font-base { font-family: 16px }` is junk. */
+  --font-base: 16px;
+  --font-lg: calc(var(--font-base) * 1.26);
+  --font-xl: calc(var(--font-base) * 1.58);
+  --font-sm: 14px;
+
+  --focus-ring: #0284c7;
+  --scrollbar-thumb: #cbd5e1;
+  --scrollbar-thumb-hover: #94a3b8;
+  --shadow-panel: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 3px rgb(15 23 42 / 0.06);
+  --grid-line: #e2e8f0;
+  color-scheme: light;
+}
+
+html[data-theme='dark'] {
   --color-ink: #0b0f17;
   --color-panel: #111826;
   --color-edge: #1f2937;
-  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace;
-}
 
-html { color-scheme: dark; }
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-700: #334155;
+
+  --color-sky-300: #7dd3fc;
+  --color-accent: #38bdf8;
+  --color-accent-ink: #06121f;
+  --color-sky-400: #38bdf8;
+  --color-red-300: #fca5a5;
+  --color-red-400: #f87171;
+  --color-red-500: #ef4444;
+  --color-green-300: #86efac;
+  --color-green-400: #4ade80;
+  --color-amber-300: #fcd34d;
+  --color-amber-400: #fbbf24;
+  --color-purple-300: #d8b4fe;
+
+  --focus-ring: #38bdf8;
+  --scrollbar-thumb: #263244;
+  --scrollbar-thumb-hover: #35455c;
+  --shadow-panel: none;
+  --grid-line: #1f2937;
+  color-scheme: dark;
+}
 
 body {
   margin: 0;
   background: var(--color-ink);
-  color: #e2e8f0;
-  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--color-slate-300);
+  font-family: var(--font-display);
+  font-size: var(--font-base);
   -webkit-font-smoothing: antialiased;
 }
 
-/* Tabular figures everywhere a number changes in place, so a cost column does
-   not jitter sideways every time a turn lands. */
-.tnum { font-variant-numeric: tabular-nums; }
+/* Wire the ladder explicitly — without these the browser's own 2em/1.5em
+   defaults win and the tokens above sit unused. */
+h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.02em; text-wrap: balance; margin: 0; }
+h1 { font-size: var(--font-xl); font-weight: 900; letter-spacing: -0.03em; }
+h2 { font-size: var(--font-lg); font-weight: 700; }
+h3 { font-size: calc(var(--font-base) * 1.12); font-weight: 700; }
+
+/* Prose — the places a human reads sentences rather than scans a grid. */
+p, dd, .prose { font-family: var(--font-body); }
+
+/*
+ * Figures. `.tnum` was already on every numeric cell in the app, so it is the
+ * natural place to hang Source Sans 3 as well: one class change gives every
+ * cost, count and duration column the figure face and tabular widths, so a
+ * cost column stops jittering sideways each time a turn lands.
+ */
+.tnum {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: #263244; border-radius: 6px; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-track { background: transparent; }
 
-:where(a, button, input, select, textarea):focus-visible {
-  outline: 2px solid #38bdf8;
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* Motion, kept to the two things that genuinely aid comprehension: a row
+   opening, and a value that just changed. Both respect the OS setting. */
+@keyframes orc-fade-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+.orc-reveal { animation: orc-fade-in 140ms ease-out; }
+
+@keyframes orc-flash { 0% { background-color: color-mix(in srgb, var(--focus-ring) 22%, transparent); } 100% { background-color: transparent; } }
+.orc-flash { animation: orc-flash 900ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .orc-reveal, .orc-flash, .animate-pulse { animation: none !important; }
+  * { transition-duration: 1ms !important; }
 }
