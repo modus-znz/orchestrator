@@ -1,0 +1,19 @@
+services:
+  orchestrator:
+    build: .
+    image: orchestrator:latest
+    container_name: orchestrator
+    ports:
+      - "3000:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: demo
+      DB_PATH: /app/data/app.db
+    volumes:
+      - demo-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  demo-data:
