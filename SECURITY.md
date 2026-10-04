@@ -8,4 +8,4 @@
 
 ## Reporting a Vulnerability
 
-Please report security vulnerabilities to `hello@moduslabs.dev`. Do not report security vulnerabilities through public GitHub issues.
+Please report security vulnerabilities to `modus.labs.znz@gmail.com`. Do not report security vulnerabilities through public GitHub issues.
