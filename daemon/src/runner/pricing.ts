@@ -21,13 +21,67 @@ export interface ModelPrice {
 const CACHE_WRITE_MULTIPLIER = 1.25;
 const CACHE_READ_MULTIPLIER = 0.1;
 
-export const DEFAULT_PRICES: Readonly<Record<string, ModelPrice>> = {
+/**
+ * Published per-model rates, in USD per million tokens.
+ *
+ * Maintained by hand, which makes every figure derived from them a guess whose
+ * accuracy depends on how current this table was on the day the job ran. An
+ * operator who does not want to wait for a release can override any row from
+ * `prices.json` (see `mergePrices` and the daemon's loader) — that file is read
+ * at start and is deliberately NOT an API setting, because a caller able to
+ * rewrite prices can set every row to 0.0001 and switch off the budget kill
+ * fleet-wide. That is the same gate `allowBypassPermissions` refuses to expose.
+ */
+const BASE_PRICES: Readonly<Record<string, ModelPrice>> = {
   haiku: { inputPerMTok: 1, outputPerMTok: 5 },
   sonnet: { inputPerMTok: 3, outputPerMTok: 15 },
   opus: { inputPerMTok: 15, outputPerMTok: 75 },
   fable: { inputPerMTok: 30, outputPerMTok: 150 },
-  unknown: { inputPerMTok: 15, outputPerMTok: 75 },
 };
+
+/** Wire-id substrings we can price. Order matters only for readability; a wire
+ *  id matches at most one of them in practice. */
+export const KNOWN_PRICE_KEYS = ['haiku', 'sonnet', 'opus', 'fable'] as const;
+
+/**
+ * The fallback row, derived per-field rather than written down.
+ *
+ * A model we failed to recognise has to price at least as high as the priciest
+ * one we do, or the estimate under-shoots exactly where we know least and the
+ * budget kill fires late. Writing the row as a literal is how that invariant
+ * rots unnoticed: it sat at 15/75 — a copy of the opus row — while fable was
+ * 30/150, so an unrecognised fable-tier model was estimated at half rate for
+ * kill purposes. Deriving it means adding or repricing any row keeps the
+ * guarantee without anyone having to remember this paragraph.
+ */
+function pessimisticRow(prices: Readonly<Record<string, ModelPrice>>): ModelPrice {
+  let inputPerMTok = 0;
+  let outputPerMTok = 0;
+  for (const [key, price] of Object.entries(prices)) {
+    if (key === 'unknown') continue;
+    inputPerMTok = Math.max(inputPerMTok, price.inputPerMTok);
+    outputPerMTok = Math.max(outputPerMTok, price.outputPerMTok);
+  }
+  return { inputPerMTok, outputPerMTok };
+}
+
+/**
+ * Layer operator overrides over the published table.
+ *
+ * `unknown` is always recomputed and never taken from the overrides: it is an
+ * invariant over the other rows, not a rate anyone publishes, and letting it be
+ * set directly would reintroduce the drift `pessimisticRow` exists to prevent.
+ */
+export function mergePrices(
+  overrides: Readonly<Record<string, ModelPrice>> = {},
+): Readonly<Record<string, ModelPrice>> {
+  const merged: Record<string, ModelPrice> = { ...BASE_PRICES, ...overrides };
+  delete merged['unknown'];
+  merged['unknown'] = pessimisticRow(merged);
+  return merged;
+}
+
+export const DEFAULT_PRICES: Readonly<Record<string, ModelPrice>> = mergePrices();
 
 export interface Usage {
   readonly input_tokens?: number;
@@ -37,11 +91,12 @@ export interface Usage {
 }
 
 /** Map a wire model id like `claude-haiku-4-5-20251001` onto a price row.
- *  Unknown models price as opus — an over-estimate kills early, and killing a
- *  job early is a far cheaper mistake than not killing a runaway one. */
+ *  Anything we cannot place falls to the derived `unknown` row, which prices at
+ *  the highest rate we know of — an over-estimate kills a job early, and that
+ *  is a far cheaper mistake than failing to kill a runaway one. */
 export function priceKeyFor(model: string | undefined): string {
   const m = (model ?? '').toLowerCase();
-  for (const key of ['haiku', 'sonnet', 'opus', 'fable']) {
+  for (const key of KNOWN_PRICE_KEYS) {
     if (m.includes(key)) return key;
   }
   return 'unknown';

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { api, ApiError, setToken } from './lib/api';
 import { clearToken, loadToken, saveToken } from './lib/token';
 import { useEventStream } from './lib/hooks';
@@ -10,11 +10,15 @@ import { TokenGate } from './components/TokenGate';
 import { Fleet } from './views/Fleet';
 import { Jobs } from './views/Jobs';
 import { Settings } from './views/Settings';
+import { NotFound } from './views/NotFound';
 
 /** Recharts is two thirds of the bundle and only one view needs it, so the
  *  three views an operator actually leaves open do not pay for it. */
 const Graphs = lazy(() => import('./views/Graphs').then((m) => ({ default: m.Graphs })));
 const JobDetail = lazy(() => import('./views/JobDetail').then((m) => ({ default: m.JobDetail })));
+// Insights is four independent queries against the learning store and nothing
+// else in the app imports it — exactly the shape that belongs behind a split.
+const Insights = lazy(() => import('./views/Insights').then((m) => ({ default: m.Insights })));
 import type { Health } from './lib/types';
 
 function AppInner() {
@@ -128,8 +132,12 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
             path="/graphs"
             element={<Lazy><Graphs tick={tick} /></Lazy>}
           />
+          <Route path="/insights" element={<Lazy><Insights /></Lazy>} />
           <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
+          {/* A real 404 rather than a silent redirect: a stale link that lands
+              you on the fleet with no explanation is the hardest kind of bug
+              to report, because nothing looks broken. */}
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </main>
     </>
@@ -168,7 +176,7 @@ function useHotkeys(): void {
 
       if (pending.current) {
         pending.current = false;
-        const to = { '1': '/', '2': '/jobs', '3': '/graphs', '4': '/settings' }[e.key];
+        const to = { '1': '/', '2': '/jobs', '3': '/graphs', '4': '/insights', '5': '/settings' }[e.key];
         if (to) {
           e.preventDefault();
           navigate(to);

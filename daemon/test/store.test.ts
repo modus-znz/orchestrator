@@ -82,6 +82,27 @@ describe('Store', () => {
     store = rebuilt;
   });
 
+  it('prefers the settled cost in the terminal event over the sum of its estimates', () => {
+    // The turn estimates come from DEFAULT_PRICES, which is a table we maintain
+    // by hand and which drifts every time Anthropic reprices. total_cost_usd
+    // is what was actually billed. A rebuild that re-summed the estimates would
+    // silently rewrite months of reconciled history to whatever the price table
+    // happened to say on the day of the rebuild.
+    store.appendEvent(ev({ seq: 0, type: 'job.queued', payload: { job: job() } }));
+    store.appendEvent(ev({ seq: 1, type: 'cost.turn', payload: { model: 'opus', usd: 0.9 } }));
+    store.appendEvent(ev({ seq: 2, type: 'cost.turn', payload: { model: 'opus', usd: 0.9 } }));
+    store.appendEvent(ev({ seq: 3, type: 'job.finished', payload: { exitCode: 0, costUsd: 0.61, estimated: false } }));
+    store.close();
+
+    const rebuilt = new Store(join(home, 'rebuilt-cost.db'));
+    rebuilt.rebuildFromLogs();
+    expect(rebuilt.getJob('job-1')?.costUsd).toBeCloseTo(0.61);
+    // numTurns still comes from the turn events — the CLI reports a total, not a count.
+    expect(rebuilt.getJob('job-1')?.numTurns).toBe(2);
+    rebuilt.close();
+    store = rebuilt;
+  });
+
   it('assigns a fleet-wide event id that orders sessions against each other', () => {
     // The point of the id: seq 0 in two different sessions says nothing about
     // which happened first, and an SSE client needs exactly that.
@@ -245,3 +266,43 @@ describe('queueDepthSeries', () => {
   });
 });
 
+
+describe('courier spend', () => {
+  it('records what a steer cost, tagged apart from the job it steered', async () => {
+    const store = await freshStore();
+    store.appendEvent(ev({ type: 'cost.turn', payload: { model: 'haiku', usd: 0.4, inputTokens: 10, outputTokens: 2 } }));
+    store.appendEvent(
+      ev({
+        seq: 1,
+        jobId: null,
+        type: 'steer.sent',
+        source: 'api',
+        payload: { peerName: 'peer-1', message: 'stop', costUsd: 0.05, model: 'haiku', error: null },
+      }),
+    );
+
+    const byModel = store.costByModel();
+    // Two slices, not one: a steer that billed under 'haiku' would silently
+    // inflate the tier the job itself ran on, and the two are different kinds
+    // of spend an operator makes different decisions about.
+    expect(byModel.find((m) => m.model === 'haiku')?.usd).toBeCloseTo(0.4);
+    expect(byModel.find((m) => m.model === 'courier:haiku')?.usd).toBeCloseTo(0.05);
+    // It still counts toward the total, because it is real money.
+    expect(store.costSeries('hour').reduce((a, b) => a + b.usd, 0)).toBeCloseTo(0.45);
+    store.close();
+  });
+
+  it('does not open a zero-cost row for a steer that never billed', async () => {
+    const store = await freshStore();
+    store.appendEvent(
+      ev({
+        jobId: null,
+        type: 'steer.failed',
+        source: 'api',
+        payload: { peerName: 'peer-1', message: 'stop', costUsd: 0, model: 'haiku', error: 'no such peer' },
+      }),
+    );
+    expect(store.costByModel()).toHaveLength(0);
+    store.close();
+  });
+});

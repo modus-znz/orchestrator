@@ -26,6 +26,7 @@ const VALUED = new Set([
   'status',
   'reason',
   'port',
+  'remove',
 ]);
 
 export function parseArgs(argv: readonly string[]): Parsed {
@@ -107,7 +108,8 @@ export const KNOWN: Readonly<Record<string, readonly string[]>> = {
   ps: ['all', 'status'],
   logs: ['follow'],
   cancel: ['reason'],
-  steer: [],
+  steer: ['force'],
+  allow: ['list', 'remove'],
   attach: ['terminal'],
   fleet: [],
   ui: ['print'],

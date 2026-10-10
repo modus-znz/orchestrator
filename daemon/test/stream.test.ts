@@ -2,7 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { StreamParser, LineSplitter } from '../src/runner/stream.js';
-import { estimateUsd, priceKeyFor } from '../src/runner/pricing.js';
+import {
+  estimateUsd,
+  mergePrices,
+  priceKeyFor,
+  KNOWN_PRICE_KEYS,
+} from '../src/runner/pricing.js';
 import type { UnsequencedEvent } from '../src/types.js';
 
 const FIXTURE = readFileSync(
@@ -91,9 +96,41 @@ describe('pricing', () => {
     expect(priceKeyFor(undefined)).toBe('unknown');
   });
 
-  it('prices an unknown model as the most expensive one, so it kills early', () => {
+  it('prices an unknown model at least as high as every model it knows', () => {
+    // Asserted as a property, not as equality with one named row. The previous
+    // version of this test pinned `unknown` to opus, which is how the row came
+    // to sit at half of fable's rate without anything going red: the assertion
+    // agreed with the bug. Anything that raises a row now has to raise this
+    // one too, whoever adds it and whether or not they read pricing.ts.
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000 };
+    const unknown = estimateUsd('some-new-model', usage);
+    for (const key of KNOWN_PRICE_KEYS) {
+      expect(unknown).toBeGreaterThanOrEqual(estimateUsd(key, usage));
+    }
+    expect(unknown).toBe(estimateUsd('claude-fable-5-1', usage));
+  });
+
+  it('takes operator overrides and still derives the fallback from them', () => {
     const usage = { input_tokens: 1_000_000, output_tokens: 0 };
-    expect(estimateUsd('some-new-model', usage)).toBe(estimateUsd('claude-opus-5', usage));
+    // A rate above every published row: the fallback has to follow it up,
+    // otherwise repricing the priciest model silently under-prices the case
+    // where we know least about what we are running.
+    const prices = mergePrices({ sonnet: { inputPerMTok: 500, outputPerMTok: 900 } });
+    expect(estimateUsd('claude-sonnet-5', usage, prices)).toBe(500);
+    expect(estimateUsd('some-new-model', usage, prices)).toBe(500);
+    // Untouched rows keep their published rate.
+    expect(estimateUsd('claude-haiku-4-5', usage, prices)).toBe(
+      estimateUsd('claude-haiku-4-5', usage),
+    );
+  });
+
+  it('refuses to let an override set the fallback row directly', () => {
+    // `unknown` is an invariant over the other rows, not a rate anyone
+    // publishes. Accepting it from the file would reintroduce exactly the
+    // drift the derivation exists to prevent — and it would do it quietly.
+    const usage = { input_tokens: 1_000_000, output_tokens: 0 };
+    const prices = mergePrices({ unknown: { inputPerMTok: 0, outputPerMTok: 0 } });
+    expect(estimateUsd('some-new-model', usage, prices)).toBeGreaterThan(0);
   });
 
   it('charges cache writes above and cache reads below plain input', () => {

@@ -1,11 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { ApiServer } from './api/index.js';
 import { EventBus } from './bus.js';
+import { acquireLock } from './lock.js';
 import { Courier } from './courier/index.js';
 import { paths } from './paths.js';
 import { reconcile } from './reconcile.js';
 import { RegistryWatcher } from './registry/watcher.js';
 import { ChildRunner } from './runner/child.js';
+import { mergePrices, type ModelPrice } from './runner/pricing.js';
 import { Scheduler } from './scheduler/index.js';
 import { Store } from './store/index.js';
 
@@ -31,6 +33,52 @@ function loadRedactPatterns(): string[] {
   }
 }
 
+/**
+ * Operator overrides for the price table, one entry per model key.
+ *
+ * Read from disk at start for the same reason as the redact list, and left out
+ * of the settings API for a stronger one: these numbers drive the mid-run
+ * budget kill in `child.ts`, so a client that could write them could set every
+ * rate to a rounding error and switch budget enforcement off across the fleet.
+ * That is a gate, and a gate a caller can open with one request is not one.
+ *
+ * A malformed file is rejected whole rather than row by row. Half-applying a
+ * typo would leave the table in a state nobody wrote down, and the failure mode
+ * of a price table that is quietly wrong is a job that runs past its budget.
+ */
+function loadPriceOverrides(): Record<string, ModelPrice> {
+  let raw: string;
+  try {
+    raw = readFileSync(paths.prices, 'utf8');
+  } catch {
+    return {};
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('expected a JSON object of model key to price');
+    }
+    const out: Record<string, ModelPrice> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const row = value as Partial<ModelPrice> | null;
+      const input = row?.inputPerMTok;
+      const output = row?.outputPerMTok;
+      const ok = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+      if (!ok(input) || !ok(output)) {
+        throw new Error(`row "${key}" needs numeric inputPerMTok and outputPerMTok >= 0`);
+      }
+      out[key] = { inputPerMTok: input, outputPerMTok: output };
+    }
+    return out;
+  } catch (e) {
+    // Loud, because the fallback is a table the operator has already decided is
+    // wrong — staying silent here is how a stale rate survives a restart that
+    // was meant to fix it.
+    console.warn(`[orchestrator] ignoring ${paths.prices}: ${(e as Error).message}`);
+    return {};
+  }
+}
+
 export interface Daemon {
   readonly port: number;
   /** Jobs settled at startup from a previous unclean shutdown. */
@@ -39,6 +87,10 @@ export interface Daemon {
 }
 
 export async function startDaemon(port = DEFAULT_PORT): Promise<Daemon> {
+  // First, before anything opens a database or replays a log: a second daemon
+  // on this home would duplicate every scheduled job and settle jobs the first
+  // one still owns, and it would do it without producing a single error.
+  const lock = acquireLock(paths.lock);
   const store = new Store();
   const bus = new EventBus(store);
 
@@ -50,7 +102,7 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Daemon> {
     redactPatterns: loadRedactPatterns(),
   });
 
-  const runner = new ChildRunner(bus);
+  const runner = new ChildRunner(bus, { prices: mergePrices(loadPriceOverrides()) });
   const scheduler = new Scheduler(store, bus, runner);
   const courier = new Courier(bus);
   const watcher = new RegistryWatcher(store, bus, { isEphemeral: courier.isEphemeral });
@@ -65,7 +117,22 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Daemon> {
   watcher.start();
   const ticker = setInterval(() => scheduler.tick(), TICK_MS);
   ticker.unref?.();
-  const bound = await api.listen(port);
+
+  let bound: number;
+  try {
+    bound = await api.listen(port);
+  } catch (e) {
+    // The commonest way to get here is a port already in use, which is very
+    // often a daemon on a DIFFERENT home. Holding the lock on the way out
+    // would make that transient collision look like a permanently wedged home
+    // for the next start, and the operator would be told to delete a lock file
+    // that never had a live daemon behind it.
+    clearInterval(ticker);
+    watcher.stop();
+    store.close();
+    lock.release();
+    throw e;
+  }
 
   let stopping: Promise<void> | null = null;
   const stop = async (): Promise<void> => {
@@ -77,6 +144,7 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Daemon> {
       await api.close();
       await scheduler.drain();
       store.close();
+      lock.release();
     })();
     return stopping;
   };

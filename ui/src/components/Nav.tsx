@@ -6,7 +6,8 @@ const LINKS = [
   { to: '/', label: 'Fleet', key: '1', end: true },
   { to: '/jobs', label: 'Jobs', key: '2', end: false },
   { to: '/graphs', label: 'Graphs', key: '3', end: false },
-  { to: '/settings', label: 'Settings', key: '4', end: false },
+  { to: '/insights', label: 'Insights', key: '4', end: false },
+  { to: '/settings', label: 'Settings', key: '5', end: false },
 ] as const;
 
 const DOT: Record<StreamState, string> = {
@@ -28,7 +29,21 @@ export function Nav({ stream, onSignOut }: { stream: StreamState; onSignOut: () 
   return (
     <header className="border-b border-edge bg-ink/90 backdrop-blur">
       <div className="mx-auto flex max-w-7xl items-center gap-1 px-3 py-2 sm:gap-3 sm:px-5">
-        <span className="mr-1 font-mono text-sm font-bold tracking-tight text-slate-200 sm:mr-3">orc</span>
+        {/* An identity, not three bare letters: the mark gives the header a
+            fixed left edge that survives the nav wrapping on a phone, and the
+            subtitle says what this is to someone opening the tab cold. */}
+        <span className="mr-1 flex items-center gap-2 sm:mr-3">
+          <span
+            aria-hidden
+            className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-accent text-[11px] font-black text-accent-ink"
+          >
+            o
+          </span>
+          <span className="hidden leading-none sm:block">
+            <span className="block text-sm font-black tracking-tight text-slate-100">orchestrator</span>
+            <span className="block text-[10px] uppercase tracking-wider text-slate-500">session fleet</span>
+          </span>
+        </span>
         <nav className="flex items-center gap-1" aria-label="Views">
           {LINKS.map((l) => (
             <NavLink

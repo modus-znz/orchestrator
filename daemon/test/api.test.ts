@@ -184,9 +184,34 @@ describe('job lookup and cancel', () => {
   });
 
   it('409s a cancel of a job that already finished', async () => {
-    const { jobs } = await json(await post('/api/jobs', { prompt: 'x', cwd: home }));
-    const id = jobs[0].id;
-    store.putJob({ ...store.getJob(id)!, status: 'succeeded' });
+    // Written straight into the store rather than POSTed. A job created through
+    // the API is immediately the scheduler's to start, and the scheduler's
+    // job.started projection will write 'running' back over a hand-set
+    // 'succeeded' — a race the route under test has no part in, and one that
+    // made this assertion flake. A job the scheduler never sees tests the same
+    // rule deterministically.
+    const id = 'job-already-finished';
+    store.putJob({
+      id,
+      prompt: 'x',
+      cwd: home,
+      model: 'sonnet',
+      budgetUsd: 1,
+      timeoutMs: 60_000,
+      permissionMode: 'default',
+      dependsOn: [],
+      steerable: false,
+      status: 'succeeded',
+      sessionId: null,
+      createdAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: new Date().toISOString(),
+      costUsd: 0,
+      numTurns: 0,
+      exitCode: 0,
+      error: null,
+      cliVersion: null,
+    });
     const res = await post(`/api/jobs/${id}/cancel`, {});
     expect(res.status).toBe(409);
   });
@@ -447,5 +472,72 @@ describe('static UI', () => {
     const res = await fetch(`${base}/`);
     expect(res.status).toBe(404);
     expect((await json(res)).error).toContain('not built');
+  });
+});
+
+describe('learning endpoints', () => {
+  /** Feed the fleet's own ingest path rather than the learning store directly —
+   *  the point of the seam is that appendEvent is the only door, and a test that
+   *  bypassed it would still pass if the wiring were ripped out. */
+  const feed = (type: string, payload: unknown) =>
+    store.appendEvent({
+      jobId: 'job-x',
+      sessionId: 'sess-x',
+      seq: store.nextSeq('sess-x'),
+      ts: new Date().toISOString(),
+      source: 'child',
+      type,
+      payload,
+    } as Parameters<typeof store.appendEvent>[0]);
+
+  it('reports tool health that arrived through appendEvent, not through a back door', async () => {
+    feed('tool.use', { id: 'k1', name: 'Bash', input: { command: 'npm run build' } });
+    feed('tool.result', { toolUseId: 'k1', isError: false });
+    const { tools } = await json(await call('/api/learning/tools'));
+    expect(tools.find((t: { argClass: string }) => t.argClass === 'npm run')?.ok).toBe(1);
+  });
+
+  it('hands back a recommendation with every denial', async () => {
+    feed('tool.use', { id: 'k2', name: 'Read', input: { file_path: '/etc/hosts' } });
+    feed('raw', {
+      subtype: 'permission_denied',
+      tool_use_id: 'k2',
+      decision_reason_type: 'workingDir',
+      decision_reason: 'Path is outside allowed working directories',
+    });
+    const body = await json(await call('/api/learning/denials'));
+    expect(body.denials[0].recommendation).toMatch(/allowedTools|working directory/);
+  });
+
+  it('exposes the cache columns the costs projection drops', async () => {
+    feed('cost.turn', {
+      model: 'haiku',
+      usd: 0.03,
+      estimated: true,
+      inputTokens: 10,
+      outputTokens: 4,
+      cacheCreationTokens: 23173,
+      cacheReadTokens: 14098,
+    });
+    const { rows } = await json(await call('/api/learning/tokens?by=model'));
+    expect(rows[0].cacheRead).toBe(14098);
+    expect(rows[0].cacheHitRatio).toBeGreaterThan(0);
+  });
+
+  it('refuses a learning query without a token, like every other /api route', async () => {
+    const res = await fetch(`${base}/api/learning/tools`);
+    expect(res.status).toBe(401);
+  });
+
+  it('reports its own health, including drops, so the panel can say why it is empty', async () => {
+    const body = await json(await call('/api/learning/status'));
+    expect(body.available).toBe(true);
+    expect(body).toHaveProperty('drops');
+    expect(body).toHaveProperty('schemaVersion');
+  });
+
+  it('bounds an unreasonable limit rather than trusting the query string', async () => {
+    const { tools } = await json(await call('/api/learning/tools?limit=999999'));
+    expect(Array.isArray(tools)).toBe(true);
   });
 });

@@ -154,7 +154,7 @@ and makes it structurally incapable of leaking a path or a secret.
 | `ts` | |
 | `outcome` | `ok` \| `error` \| `denied` |
 | `deny_reason_type` | e.g. `workingDir`, only for denials |
-| `deny_reason` | the human-readable reason, only for denials |
+| `deny_reason` | the harness's own reason, redacted and clipped to 200 chars — the one free-text column, see §11 |
 
 **`turn_costs`** — one row per `cost.turn`.
 
@@ -214,7 +214,7 @@ in-place-update coupling the split above exists to avoid.
 | view | answers |
 |---|---|
 | `v_tool_health` | calls · ok · error · denied · error-rate · p50/p95 duration, per tool and `arg_class` |
-| `v_denials` | denials grouped by `deny_reason_type` and path prefix |
+| `v_denials` | denials grouped by `deny_reason_type`, tool and `arg_class` — never by path, which the store does not hold |
 | `v_token_economics` | per job and model: cache-hit ratio, cost per turn, estimated-vs-actual |
 | `v_skill_demand` | Skill invocations by name — the `claude-metrics` export seam |
 
@@ -365,3 +365,19 @@ structurally incapable of holding tool content.** Redaction is not a filter
 applied at render time that a future query could bypass — the content simply
 never enters the database. `arg_class` is a bounded classification and the
 multiplexer allowlist (§4) is the guard that keeps it bounded.
+
+**One column is a documented exception, and it is worth being exact about it.**
+`deny_reason` is free text authored by the harness, and while it is close to a
+fixed set in practice (`Path is outside allowed working directories`), one
+observed variant quotes the command it refused: `find with '-exec' executes
+commands or modifies files — cannot be auto-allowed by a Bash(find:*) prefix
+rule`. So it is not a bounded enum and cannot honestly be described as one.
+
+It is kept, because dropping it would leave the denials panel able to say only
+that *something* was refused — which recommends nothing, and recommending
+something is the entire reason the panel exists. It is made safe by passing it
+through the daemon's own `redactString` and clipping it to 200 characters
+before it is stored. That reuses one redaction implementation rather than
+inventing a second rule for this column, and the clip bounds the blast radius
+of any future harness message that turns out to be chattier than these two.
+Every other column in the store remains content-free by construction.

@@ -134,3 +134,100 @@ export interface FailureStats {
   readonly byStatus: ReadonlyArray<{ status: string; count: number }>;
   readonly recent: ReadonlyArray<{ id: string; name: string; error: string | null; finishedAt: string | null }>;
 }
+
+/* ---------------------------------------------------------------------------
+ * Learning store (Phase H).
+ *
+ * These mirror the row interfaces in daemon/src/learning/queries.ts. They are
+ * restated rather than imported because the UI is a separate package with its
+ * own build — but every field name here was copied from that file, and the
+ * daemon's tests are what keep the shapes honest.
+ * ------------------------------------------------------------------------- */
+
+/** The windows the API accepts. Anything else falls back to all of time. */
+export type LearningWindow = '1h' | '6h' | '24h' | '7d' | '30d';
+
+export interface ToolHealthRow {
+  readonly toolName: string;
+  /** A bounded classification of the argument — `git commit`, `.ts` — never
+   *  the argument itself. Null when the tool classifies to nothing. */
+  readonly argClass: string | null;
+  readonly calls: number;
+  readonly ok: number;
+  readonly errors: number;
+  readonly denied: number;
+  readonly pending: number;
+  readonly bySubagent: number;
+  readonly p50Ms: number | null;
+  readonly p95Ms: number | null;
+  readonly lastTs: string | null;
+}
+
+export interface DenialRow {
+  readonly reasonType: string | null;
+  readonly toolName: string;
+  readonly argClass: string | null;
+  readonly denials: number;
+  readonly sampleReason: string | null;
+  readonly lastTs: string | null;
+  /** The whole point of the panel: what to change, not merely what broke. */
+  readonly recommendation: string;
+}
+
+export interface TokenRow {
+  readonly key: string;
+  readonly turns: number;
+  readonly usd: number;
+  readonly input: number;
+  readonly output: number;
+  readonly cacheCreation: number;
+  readonly cacheRead: number;
+  /** Reads over everything presented to the model. Null when nothing was. */
+  readonly cacheHitRatio: number | null;
+  readonly estimatedTurns: number;
+  readonly lastTs: string | null;
+}
+
+export interface SkillRow {
+  readonly skill: string;
+  readonly invocations: number;
+  readonly errors: number;
+  readonly jobs: number;
+  readonly lastTs: string | null;
+}
+
+/** `available: false` is a real answer, not an error — the daemon runs fine
+ *  without a learning store, and the panel says so rather than showing 503s. */
+export type LearningStatus =
+  | { readonly available: false }
+  | {
+      readonly available: true;
+      readonly schemaVersion: number;
+      readonly binarySchemaVersion: number;
+      readonly toolCalls: number;
+      readonly toolOutcomes: number;
+      readonly turnCosts: number;
+      readonly sessions: number;
+      readonly drops: number;
+      readonly lastError: string | null;
+      readonly dbBytes: number;
+      readonly path: string;
+    };
+
+export interface ToolsResponse {
+  readonly window: string;
+  readonly tools: readonly ToolHealthRow[];
+}
+export interface DenialsResponse {
+  readonly window: string;
+  readonly denials: readonly DenialRow[];
+}
+export interface TokensResponse {
+  readonly window: string;
+  readonly by: 'model' | 'job';
+  readonly rows: readonly TokenRow[];
+}
+export interface SkillsResponse {
+  readonly window: string;
+  readonly skills: readonly SkillRow[];
+}

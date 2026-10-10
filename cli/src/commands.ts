@@ -199,10 +199,34 @@ export async function fleet(): Promise<void> {
   out(dim(`\n${managed} managed, ${observed} observed`));
 }
 
-/** Both steer and attach are keyed by sessionId; the operator thinks in jobs. */
+/**
+ * Both steer and attach are keyed by sessionId, but an operator addresses a
+ * session by whatever they can see. So we resolve, in order:
+ *
+ *   1. a full uuid — already a sessionId, taken as-is;
+ *   2. a session **name** or **short-id prefix** — the two things `orc fleet`
+ *      and `orc allow --list` actually print, resolved against the live fleet;
+ *   3. failing both, a **job id** — the original behaviour, for managed jobs
+ *      the operator thinks of by job rather than session.
+ *
+ * Without step 2, copying the 8-char id the tool just showed you earns a "no
+ * such job" 404 — which is exactly the trap this closes.
+ */
 async function sessionFor(target: string): Promise<string> {
-  // A 36-char uuid is already a sessionId. Anything else is a job id.
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(target)) return target;
+  // A full uuid (8-4-4-…) is already a sessionId; skip the round-trip.
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/i.test(target)) return target;
+
+  const { sessions } = await api<{ sessions: Session[] }>('GET', '/api/fleet');
+  const hits = sessions.filter(
+    (s) => s.sessionId === target || s.sessionId.startsWith(target) || s.name === target,
+  );
+  const ids = [...new Set(hits.map((s) => s.sessionId))];
+  if (ids.length === 1) return ids[0]!;
+  if (ids.length > 1) {
+    throw new Error(`"${target}" matches ${ids.length} sessions — use the full sessionId`);
+  }
+
+  // No session matched; it is a job id (or nothing).
   const { job } = await api<{ job: Job }>('GET', `/api/jobs/${encodeURIComponent(target)}`);
   if (!job.sessionId) throw new Error(`job ${target} has no session yet (status: ${job.status})`);
   return job.sessionId;
@@ -215,14 +239,136 @@ export async function steer(p: Parsed): Promise<void> {
   if (!text) throw new Error('orc steer needs a message');
 
   const sessionId = await sessionFor(target);
+
+  // Steering an *observed* session injects text into a live interactive session
+  // that a human — or its own agent — is currently driving. Redirecting a
+  // managed job in flight is the whole point of steer; interrupting a busy
+  // interactive session the daemon did not start is a different, louder act, so
+  // it must be deliberate. --force is the deliberate.
+  if (!bool(p.flags, 'force')) {
+    const { sessions } = await api<{ sessions: Session[] }>('GET', '/api/fleet');
+    const s = sessions.find((x) => x.sessionId === sessionId);
+    if (s && s.kind === 'observed' && s.status === 'busy') {
+      throw new Error(
+        `session ${sessionId.slice(0, 8)} (${s.name ?? 'unnamed'}) is observed and busy — ` +
+          'steering it now injects text into work already in progress. ' +
+          'Re-run with --force if you mean to interrupt it.',
+      );
+    }
+  }
+
   const result = await api<{ delivered: boolean; costUsd: number; error: string | null }>(
     'POST',
     `/api/sessions/${encodeURIComponent(sessionId)}/steer`,
-    { message: text },
+    { text },
   );
   // The cost is printed either way: a courier that failed still billed.
   out(`${result.delivered ? 'delivered' : 'NOT delivered'}  ${dim(usd(result.costUsd))}`);
   if (result.error) out(dim(result.error));
+}
+
+/* ------------------------------------------------------------- allowlist */
+
+/**
+ * Resolve an operator's argument to a sessionId. A uuid passes straight
+ * through; a name is looked up against the live fleet.
+ *
+ * We store the id, never the name — deliberately. Peer names are *derived*, not
+ * assigned (F19): they change across a restart and can come to point at a
+ * different session entirely. An allowlist of names is therefore an allowlist
+ * whose meaning drifts, so the moment a name is given we pin it to the id it
+ * denotes right now.
+ */
+async function resolveToSessionId(target: string, sessions: readonly Session[]): Promise<string> {
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(target)) return target;
+  const matches = sessions.filter((s) => s.alive && s.name === target);
+  if (matches.length === 0) {
+    throw new Error(`no live session named "${target}" — pass a sessionId, or check \`orc fleet\``);
+  }
+  if (matches.length > 1) {
+    const ids = matches.map((s) => s.sessionId.slice(0, 8)).join(', ');
+    throw new Error(`"${target}" names ${matches.length} live sessions (${ids}); names are not unique — pass the sessionId`);
+  }
+  return matches[0]!.sessionId;
+}
+
+/**
+ * Manage the daemon's steer allowlist — the only gate on steering an observed
+ * session. `orc allow <id|name>` adds, `--remove <id|name>` revokes, `--list`
+ * shows the current set and prunes entries that name no live session.
+ *
+ * The allowlist is a single settings key holding an array, and PUT replaces a
+ * key wholesale, so every mutation here is read-modify-write against the live
+ * value rather than a blind overwrite.
+ */
+export async function allow(p: Parsed): Promise<void> {
+  const { settings } = await api<{ settings: { steerAllowlist: string[] } }>('GET', '/api/settings');
+  const current = settings.steerAllowlist;
+  const inFleet = async (): Promise<Session[]> =>
+    (await api<{ sessions: Session[] }>('GET', '/api/fleet')).sessions;
+
+  // --list: show the allowlist and prune anything that no longer names a live
+  // session. A stale id is harmless (it just fails `session_gone` on use), but a
+  // list that quietly accretes dead ids stops being something you can read.
+  if (bool(p.flags, 'list')) {
+    const sessions = await inFleet();
+    const liveIds = new Set(sessions.filter((s) => s.alive).map((s) => s.sessionId));
+    const liveNames = new Set(
+      sessions.filter((s) => s.alive).map((s) => s.name).filter((n): n is string => n !== null),
+    );
+    const kept = current.filter((e) => liveIds.has(e) || liveNames.has(e));
+    const dropped = current.filter((e) => !kept.includes(e));
+    if (dropped.length) await api('PUT', '/api/settings', { steerAllowlist: kept });
+
+    if (kept.length === 0) {
+      out(dim('allowlist is empty — nothing observed can be steered'));
+    } else {
+      for (const e of kept) {
+        const s = sessions.find((x) => x.sessionId === e || x.name === e);
+        const label = e.length >= 36 ? e.slice(0, 8) : e;
+        out(`${bold(label)}  ${s ? `${s.name ?? dim('-')}  ${s.status ?? '-'}` : dim('(not live)')}`);
+      }
+    }
+    if (dropped.length) out(dim(`pruned ${dropped.length} dead entr${dropped.length === 1 ? 'y' : 'ies'}`));
+    return;
+  }
+
+  // --remove <id|name>: drop by what is stored, falling back to name→id so you
+  // can remove by the name you added even though we stored the id.
+  const remove = str(p.flags, 'remove');
+  if (remove !== undefined) {
+    let next = current.filter((e) => e !== remove);
+    if (next.length === current.length && !/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(remove)) {
+      try {
+        const id = await resolveToSessionId(remove, await inFleet());
+        next = current.filter((e) => e !== id);
+      } catch {
+        // Name no longer resolves; nothing to remove by that route.
+      }
+    }
+    if (next.length === current.length) {
+      out(dim(`"${remove}" was not in the allowlist`));
+      return;
+    }
+    await api('PUT', '/api/settings', { steerAllowlist: next });
+    out(`removed ${remove}`);
+    return;
+  }
+
+  // Bare positional: add.
+  const target = p.positional[0];
+  if (!target) {
+    throw new Error('orc allow needs a sessionId or name (or --list, or --remove <id|name>)');
+  }
+  const sessions = await inFleet();
+  const id = await resolveToSessionId(target, sessions);
+  if (current.includes(id)) {
+    out(dim(`${id.slice(0, 8)} is already allowed`));
+    return;
+  }
+  await api('PUT', '/api/settings', { steerAllowlist: [...current, id] });
+  const s = sessions.find((x) => x.sessionId === id);
+  out(`allowed ${bold(id.slice(0, 8))}${s?.name ? `  (${s.name})` : ''} — steerable now`);
 }
 
 export async function attach(p: Parsed): Promise<void> {

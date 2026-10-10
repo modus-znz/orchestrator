@@ -13,6 +13,12 @@ export const SCHEMA_VERSION = 2;
 export const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+-- WAL allows one writer and many readers, and every call into this store is a
+-- synchronous one — so without a timeout a second process (or a long-running
+-- read holding the write lock) surfaces as SQLITE_BUSY thrown straight out of
+-- an ordinary method call rather than as a short wait. Five seconds is far
+-- longer than any statement here legitimately takes.
+PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS jobs (
   id               TEXT PRIMARY KEY,

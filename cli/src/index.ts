@@ -15,6 +15,8 @@ const HELP = `${bold('orc')} — orchestrate Claude Code sessions
   orc logs <job> [-f]         replay a job's events, optionally following
   orc cancel <job> [--reason] stop a job
   orc steer <job|session> <text>   relay an instruction to a running session
+      --force                 steer a busy observed session anyway (interrupts it)
+  orc allow <id|name>         let an observed session be steered (--list, --remove <id>)
   orc attach <job|session>    open a terminal on that session and hand it over
   orc fleet                   every live session, managed and observed
   orc ui [--print]            open the dashboard (token in the URL fragment)
@@ -38,6 +40,7 @@ async function main(): Promise<number> {
     case 'logs': await cmd.logs(parsed); return 0;
     case 'cancel': await cmd.cancel(parsed); return 0;
     case 'steer': await cmd.steer(parsed); return 0;
+    case 'allow': await cmd.allow(parsed); return 0;
     case 'attach': await cmd.attach(parsed); return 0;
     case 'fleet': await cmd.fleet(); return 0;
     case 'ui': await cmd.ui(parsed); return 0;

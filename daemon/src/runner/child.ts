@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { EventBus } from '../bus.js';
 import type { JobRecord } from '../types.js';
+import type { ModelPrice } from './pricing.js';
 import { LineSplitter, StreamParser } from './stream.js';
 
 export interface RunOptions {
@@ -14,6 +15,9 @@ export interface RunOptions {
   /** How long to wait after the child exits for its stdio to close before
    *  giving up on the tail of the stream. */
   readonly stdioGraceMs?: number;
+  /** Price table backing the mid-run budget estimate. Supplied once at boot
+   *  from `prices.json`; omitted, the published table is used. */
+  readonly prices?: Readonly<Record<string, ModelPrice>>;
 }
 
 export interface RunHandle {
@@ -73,7 +77,7 @@ export class ChildRunner {
     // Pre-minting the session id means the join to the harness registry is
     // known before the process exists, rather than raced for afterwards (§4.1).
     const sessionId = job.sessionId ?? randomUUID();
-    const parser = new StreamParser(job.id, sessionId);
+    const parser = new StreamParser(job.id, sessionId, this.#opts.prices);
     const splitter = new LineSplitter();
     const errSplitter = new LineSplitter();
     const bin = this.#opts.claudeBin ?? 'claude';

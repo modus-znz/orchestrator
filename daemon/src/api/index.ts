@@ -13,6 +13,14 @@ import { HttpError, Router, badRequest, conflict, forbidden, notFound, readJson,
 import { serveStatic, uiDir } from './static.js';
 import { SseHub } from './sse.js';
 import { parseJobSpecs, parseSettingsPatch } from './validate.js';
+import {
+  denials,
+  exportToolEvents,
+  skillDemand,
+  tokenEconomics,
+  toolHealth,
+  type Window,
+} from '../learning/queries.js';
 
 export interface ApiOptions {
   readonly port?: number;
@@ -31,6 +39,25 @@ export interface ApiDeps {
 
 const HOUR_MS = 60 * 60 * 1000;
 const asBucket = (v: string | null): Bucket => (v === 'day' ? 'day' : 'hour');
+
+/**
+ * `?window=24h` and friends, resolved here rather than passed as a raw
+ * timestamp, so a caller cannot ask the learning store to scan all history by
+ * accident. `all` is available but has to be spelled out.
+ */
+const WINDOWS: Record<string, number> = { '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 };
+
+function asWindow(query: URLSearchParams): Window {
+  const key = query.get('window') ?? '24h';
+  const hours = WINDOWS[key];
+  const job = query.get('job');
+  const limit = Number(query.get('limit'));
+  return {
+    ...(hours ? { since: new Date(Date.now() - hours * 3_600_000).toISOString() } : {}),
+    ...(job ? { jobId: job } : {}),
+    ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+  };
+}
 
 /**
  * The REST + SSE surface (§5.1).
@@ -62,17 +89,23 @@ export class ApiServer {
   }
 
   #routes(): void {
-    const { store, scheduler, courier, watcher } = this.#deps;
+    const { store, scheduler, bus, courier, watcher } = this.#deps;
     const r = this.#router;
 
     r.add('GET', '/api/health', ({ res }) => {
+      const failures = bus.storeFailures;
       sendJson(res, 200, {
-        ok: true,
+        // `ok` is about the run, not about the process answering: a daemon that
+        // is up but has failed to persist events is exactly the state a health
+        // check exists to catch, and it would otherwise report a cheerful 200.
+        ok: failures.count === 0,
         pid: process.pid,
         uptimeMs: Date.now() - this.#startedAt,
         running: scheduler.runningCount,
         sseClients: this.#sse.clientCount,
         latestEventId: store.latestEventId(),
+        storeFailures: failures.count,
+        lastStoreError: failures.lastError,
       });
     });
 
@@ -213,6 +246,56 @@ export class ApiServer {
       });
       scheduler.tick();
       sendJson(res, 200, { settings });
+    });
+
+    // ---------------------------------------------------------------
+    // Learning (Phase H). Every one of these degrades to 503 rather than
+    // 500 when the store could not be opened: the orchestrator's real job
+    // does not depend on it, and a dashboard should say "unavailable"
+    // rather than show an error that implies something broke in the fleet.
+    // ---------------------------------------------------------------
+    const learning = () => {
+      const l = store.learning;
+      if (!l) throw new HttpError(503, 'the learning store is unavailable; see /api/learning/status');
+      return l;
+    };
+
+    r.add('GET', '/api/learning/tools', ({ res, query }) => {
+      const w = asWindow(query);
+      sendJson(res, 200, { window: query.get('window') ?? '24h', tools: toolHealth(learning().db, w) });
+    });
+
+    r.add('GET', '/api/learning/denials', ({ res, query }) => {
+      // Each row carries its own recommendation. A denial without a next step
+      // is just a number, and the panel exists to hand over the config line.
+      sendJson(res, 200, {
+        window: query.get('window') ?? '24h',
+        denials: denials(learning().db, asWindow(query)),
+      });
+    });
+
+    r.add('GET', '/api/learning/tokens', ({ res, query }) => {
+      const by = query.get('by') === 'model' ? 'model' : 'job';
+      sendJson(res, 200, { window: query.get('window') ?? '24h', by, rows: tokenEconomics(learning().db, by, asWindow(query)) });
+    });
+
+    r.add('GET', '/api/learning/skills', ({ res, query }) => {
+      sendJson(res, 200, { window: query.get('window') ?? '24h', skills: skillDemand(learning().db, asWindow(query)) });
+    });
+
+    r.add('GET', '/api/learning/status', ({ res }) => {
+      const l = store.learning;
+      sendJson(res, 200, l ? { available: true, ...l.status() } : { available: false });
+    });
+
+    // The claude-metrics seam. Keyset-paged so a collector resumes exactly
+    // where it stopped; nothing here knows or cares whether one exists.
+    r.add('GET', '/api/learning/export', ({ res, query }) => {
+      const cursor = query.get('cursor');
+      sendJson(res, 200, exportToolEvents(learning().db, {
+        ...asWindow(query),
+        ...(cursor ? { cursor } : {}),
+      }));
     });
 
     r.add('GET', '/api/stream', (ctx) => this.#sse.handle(ctx));

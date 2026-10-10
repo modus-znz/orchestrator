@@ -193,6 +193,9 @@ export class Courier {
         peerName: req.peerName,
         message: req.message,
         costUsd: outcome.costUsd,
+        // The tier that actually ran, so the store can label the spend rather
+        // than filing it under 'unknown'.
+        model: this.#opts.model,
         error: outcome.error,
       },
     });

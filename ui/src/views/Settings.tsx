@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../lib/api';
 import { useFetch } from '../lib/hooks';
-import { ErrorNote, Panel } from '../components/ui';
-import type { ModelTier, PermissionMode, Settings as S } from '../lib/types';
+import { CopyButton, ErrorNote, Panel } from '../components/ui';
+import { int, tidyPath } from '../lib/format';
+import type { LearningStatus, ModelTier, PermissionMode, Settings as S } from '../lib/types';
 
 const MODELS: readonly ModelTier[] = ['haiku', 'sonnet', 'opus', 'fable'];
 const MODES: readonly PermissionMode[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions'];
@@ -105,6 +106,8 @@ export function Settings() {
         </div>
       </Panel>
 
+      <LearningPanel />
+
       <div className="flex items-center gap-3">
         <button
           onClick={() => void save()}
@@ -181,5 +184,97 @@ function List({ label, hint, value, onChange }: {
         onChange={(e) => onChange(e.target.value.split('\n').map((s) => s.trim()).filter(Boolean))}
       />
     </Field>
+  );
+}
+
+/**
+ * The learning store, as an operator sees it.
+ *
+ * Read-only by design, and separate from the draft above: nothing here is a
+ * setting, so wiring it into the Save button would imply an edit that does not
+ * exist. What it does give you is the two numbers that matter when the Insights
+ * view looks wrong — whether the store is open at all, and whether it has been
+ * dropping events — plus the raw export seam for anything the panels don't ask.
+ *
+ * Unlike orchestrator.db, this file is durable: it is never dropped on a schema
+ * bump, so its facts outlive the JSONL they were folded in from.
+ */
+function LearningPanel() {
+  const { data, error } = useFetch<LearningStatus>('/api/learning/status');
+
+  if (error) return <Panel title="Learning store"><div className="px-4 py-4"><ErrorNote>{error}</ErrorNote></div></Panel>;
+  if (!data) return null;
+
+  if (!data.available) {
+    return (
+      <Panel title="Learning store" subtitle="not open">
+        <p className="prose px-4 py-4 text-sm text-slate-500">
+          This daemon started without <code className="font-mono">learning.db</code>. Restart it and
+          the store opens beside the projection and backfills from the job logs already on disk —
+          nothing recorded so far is lost.
+        </p>
+      </Panel>
+    );
+  }
+
+  // A store written by a newer binary is left alone rather than migrated
+  // backwards, so a version skew is worth surfacing rather than hiding.
+  const skewed = data.schemaVersion !== data.binarySchemaVersion;
+
+  return (
+    <Panel title="Learning store" subtitle={tidyPath(data.path)}>
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 py-4 sm:grid-cols-4">
+        <Stat label="Tool calls" value={int(data.toolCalls)} />
+        <Stat label="Outcomes" value={int(data.toolOutcomes)} />
+        <Stat label="Costed turns" value={int(data.turnCosts)} />
+        <Stat label="Sessions" value={int(data.sessions)} />
+        <Stat label="On disk" value={`${(data.dbBytes / 1e6).toFixed(1)} MB`} hint="db + WAL + shm" />
+        <Stat
+          label="Dropped"
+          value={int(data.drops)}
+          tone={data.drops > 0 ? 'bad' : 'ok'}
+          hint={data.drops > 0 ? 'ingest failed on these' : 'nothing lost'}
+        />
+        <Stat
+          label="Schema"
+          value={`v${data.schemaVersion}`}
+          tone={skewed ? 'warn' : 'ok'}
+          hint={skewed ? `binary expects v${data.binarySchemaVersion}` : 'matches this binary'}
+        />
+      </dl>
+
+      {data.lastError && (
+        <p className="px-4 pb-3 font-mono text-xs text-red-400">last ingest error: {data.lastError}</p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-3 border-t border-edge px-4 py-3">
+        <p className="prose text-xs text-slate-500">
+          Every tool call is stored as a bounded classification — <code className="font-mono">git commit</code>,
+          <code className="font-mono"> .ts</code> — never the argument itself, so no path or secret
+          reaches this file. The raw rows are available for analysis:
+        </p>
+        {/* Built from the current origin rather than a hardcoded port: the
+            daemon's port is configurable, and a command that quietly points at
+            the wrong one is worse than no command at all. A JSX attribute
+            string cannot carry the inner quotes, so this is an expression. */}
+        <CopyButton
+          text={`curl -H "Authorization: Bearer $ORCHESTRATOR_TOKEN" ${window.location.origin}/api/learning/export`}
+          label="copy export command"
+        />
+      </div>
+    </Panel>
+  );
+}
+
+function Stat({ label, value, hint, tone = 'ok' }: {
+  label: string; value: string; hint?: string | undefined; tone?: 'ok' | 'warn' | 'bad' | undefined;
+}) {
+  const TONE = { ok: 'text-slate-200', warn: 'text-amber-300', bad: 'text-red-400' } as const;
+  return (
+    <div>
+      <dt className="text-xs uppercase tracking-wider text-slate-500">{label}</dt>
+      <dd className={`tnum mt-0.5 text-lg font-semibold ${TONE[tone]}`}>{value}</dd>
+      {hint && <p className="text-xs text-slate-600">{hint}</p>}
+    </div>
   );
 }

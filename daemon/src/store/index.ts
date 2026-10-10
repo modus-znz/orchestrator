@@ -1,9 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, rmSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { paths } from '../paths.js';
 import { SCHEMA, SCHEMA_VERSION } from './schema.js';
 import { JsonlLog } from './jsonl.js';
+import { LearningStore } from '../learning/store.js';
 import {
   DEFAULT_SETTINGS,
   type FleetKind,
@@ -125,12 +126,19 @@ export class Store {
   /** Next seq per sessionId. The bus asks the store, so numbering survives a
    *  daemon restart mid-session instead of restarting at zero. */
   readonly #seq = new Map<string, number>();
+  /** Null when the learning store could not be opened. Ingest is an observer:
+   *  it must never be the reason an event fails to record. */
+  readonly #learning: LearningStore | null;
   #closed = false;
 
   constructor(dbPath: string = paths.db, log: JsonlLog = new JsonlLog()) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.#db = new DatabaseSync(dbPath);
     this.#log = log;
+    // Derived from the projection's own path, not from paths.*, so a test
+    // pointed at a scratch db keeps its learning store in the same scratch
+    // directory. This derivation is the only place the file is named.
+    this.#learning = LearningStore.open(join(dirname(dbPath), 'learning.db'));
     // A projection is only worth having if it matches the code reading it.
     // `CREATE TABLE IF NOT EXISTS` would happily leave a previous shape in
     // place, so a version mismatch drops and rebuilds instead of migrating —
@@ -143,11 +151,27 @@ export class Store {
       );
       this.#db.exec(SCHEMA);
       this.#db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-      // A no-op on a fresh install, where there are no logs to read.
-      this.rebuildFromLogs();
     } else {
       this.#db.exec(SCHEMA);
     }
+    // Unconditional, not just on a version bump. appendEvent() writes the log
+    // first and the projection second (see its note), so any kill between the
+    // two leaves the projection short by however many events were in flight —
+    // and nothing about the schema version reflects that, so the old
+    // rebuild-on-mismatch path would carry the hole forward indefinitely.
+    //
+    // A cheaper check was tried and rejected: comparing each log's last `seq`
+    // against MAX(seq) per session cannot see a hole in the middle of a
+    // session, which is precisely the shape a crash leaves behind. There is no
+    // partial answer here that is worth having.
+    //
+    // Affordable because rebuildFromLogs() truncates and replays in one pass,
+    // readAll() streams line by line rather than buffering, and the learning
+    // store's #seen() reduces a replayed event to one integer comparison. It
+    // is also what makes learning backfill free: a store that was down, or a
+    // classifier that got smarter, catches up on the next start with no
+    // separate migration to run.
+    this.rebuildFromLogs();
     for (const r of this.#db.prepare('SELECT session_id, MAX(seq) AS m FROM events GROUP BY session_id').all() as Row[]) {
       this.#seq.set(str(r['session_id']), num(r['m']) + 1);
     }
@@ -158,6 +182,12 @@ export class Store {
    *  to report that there was nowhere left to write. */
   get closed(): boolean {
     return this.#closed;
+  }
+
+  /** The learning store, or null when it could not be opened. The API checks
+   *  for null and reports the store as unavailable rather than 500ing. */
+  get learning(): LearningStore | null {
+    return this.#learning;
   }
 
   nextSeq(sessionId: string): number {
@@ -192,6 +222,17 @@ export class Store {
         JSON.stringify(event.payload ?? null),
       );
 
+    // The learning store hangs off this one call site and inherits everything
+    // from it: live ingest, crash replay, and rebuildFromLogs() backfill all
+    // funnel through appendEvent. Wrapped because a learning-store fault is
+    // never worth losing an event over — the drop is counted and surfaced in
+    // /api/learning/status instead of thrown.
+    try {
+      this.#learning?.ingest(event);
+    } catch (e) {
+      this.#learning?.recordDrop(e);
+    }
+
     if (event.type === 'cost.turn') {
       const p = (event.payload ?? {}) as Row;
       this.#db
@@ -209,6 +250,29 @@ export class Store {
           num(p['inputTokens']),
           num(p['outputTokens']),
         );
+    }
+    // A steer spawns a real child and that child bills real money, but it
+    // emits no cost.turn — so every dollar the courier spent used to be
+    // missing from the cost chart and from every total derived off it. On a
+    // fleet being actively steered that is not a rounding error.
+    //
+    // Recorded under a `courier:` model label rather than the bare tier: the
+    // column is the chart's legend, so tagging it keeps steer spend visible as
+    // its own slice instead of quietly inflating the model whose name it
+    // shares. job_id stays null because a steer addresses a session, not a job.
+    // Failed steers count too — a child that spawned and then failed still
+    // billed for the tokens it read.
+    if (event.type === 'steer.sent' || event.type === 'steer.failed') {
+      const p = (event.payload ?? {}) as Row;
+      const usd = num(p['costUsd']);
+      if (usd > 0) {
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO costs (session_id, seq, job_id, ts, model, usd, input_tokens, output_tokens)
+             VALUES (?, ?, NULL, ?, ?, ?, 0, 0)`,
+          )
+          .run(event.sessionId, event.seq, event.ts, `courier:${str(p['model'] ?? 'unknown')}`, usd);
+      }
     }
     // A replayed event hits the UNIQUE(session_id, seq) constraint and inserts
     // nothing; report the id it already has rather than a misleading 0.
@@ -602,7 +666,22 @@ export class Store {
           : e.type === 'job.failed' ? 'failed'
           : e.type === 'job.cancelled' ? 'cancelled'
           : 'budget_exceeded';
-        jobs.set(job.id, { ...job, status, finishedAt: e.ts, exitCode: nnum(p['exitCode']), error: nstr(p['error']) });
+        // costUsd comes from the terminal payload when the CLI reported one:
+        // child.ts prefers total_cost_usd over its own running estimate, so
+        // that figure is what the provider actually billed. Summing cost.turn
+        // above is only the fallback for a job that never produced a result
+        // message — without this line every rebuild would quietly overwrite a
+        // reconciled cost with a stale-priced guess, and the guess is only as
+        // good as DEFAULT_PRICES was on the day the job ran.
+        const settled = nnum(p['costUsd']);
+        jobs.set(job.id, {
+          ...job,
+          status,
+          finishedAt: e.ts,
+          exitCode: nnum(p['exitCode']),
+          error: nstr(p['error']),
+          ...(settled === null ? {} : { costUsd: settled }),
+        });
       }
     }
 
@@ -616,6 +695,7 @@ export class Store {
     if (this.#closed) return;
     this.#closed = true;
     this.#log.close();
+    this.#learning?.close();
     this.#db.close();
   }
 
